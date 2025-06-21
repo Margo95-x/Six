@@ -1,0 +1,59 @@
+{
+  "name": "distributed-nostr-node",
+  "version": "1.0.0",
+  "description": "Distributed Nostr relay node for 6-node resilient network",
+  "main": "server.js",
+  "scripts": {
+    "start": "server.js",
+    "dev": "NODE_ENV=development node server.js",
+    "test": "echo \"Testing network health...\" && node test-health.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "cors": "^2.8.5"
+  },
+  "keywords": [
+    "nostr",
+    "distributed",
+    "relay",
+    "network",
+    "resilient",
+    "tetrahedral"
+  ],
+  "author": "Distributed Network Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/distributed-nostr-network.git"
+  },
+  "environment": {
+    "production": {
+      "NODE_ENV": "production",
+      "NODE_ID": "SET_PER_NODE",
+      "NODE_ROLE": "SET_PER_NODE",
+      "PEER_1": "https://render-node-1.onrender.com",
+      "PEER_2": "https://render-node-2.onrender.com", 
+      "PEER_3": "https://render-node-3.onrender.com",
+      "PEER_4": "https://railway-node-1.up.railway.app",
+      "PEER_5": "https://railway-node-2.up.railway.app",
+      "PEER_6": "https://railway-node-3.up.railway.app",
+      "PING_URL": "SET_PER_NODE"
+    }
+  },
+  "deployment": {
+    "render": {
+      "buildCommand": "npm install",
+      "startCommand": "npm start",
+      "healthCheckPath": "/heartbeat"
+    },
+    "railway": {
+      "buildCommand": "npm install", 
+      "startCommand": "npm start",
+      "healthCheckPath": "/heartbeat"
+    }
+  }
+}
