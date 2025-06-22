@@ -78,7 +78,7 @@ class DistributedStorage {
       this.cleanupOldPosts();
     }, 6 * 60 * 60 * 1000);
   }
-  
+
   selectStorageNodes(eventId) {
     const hash = crypto.createHash('sha256').update(eventId).digest('hex');
     const nodeIndex = parseInt(hash.slice(0, 2), 16) % 2;
@@ -146,646 +146,646 @@ class DistributedStorage {
 
   cleanupCacheData() {
     if (this.role !== 'cache') return;
-    
+
     const now = Date.now();
     const deleted = [];
-    
+
     for (const [id, post] of this.localData.entries()) {
       const age = now - post.timestamp;
       let shouldDelete = false;
-      
+
       if (this.cacheType === 'hot') {
         shouldDelete = age > this.cacheTTL && post.likes.length < 5;
       } else {
         shouldDelete = age > this.cacheTTL;
       }
-      
+
       if (shouldDelete) {
         this.localData.delete(id);
         deleted.push(id);
       }
     }
-    
+
     if (deleted.length > 0) {
       console.log(`🗑️ ${this.nodeId} (${this.cacheType}) cleaned ${deleted.length} cached posts`);
     }
   }
 
   async initializeNode() {
-  console.log(`🌊 Node ${this.nodeId} starting as ${this.role}`);
-  this.connectToPeers();
-  this.startConsensusLoop();
-  this.startKeepAlive();
-  this.initializeRoleServices();
-}
+    console.log(`🌊 Node ${this.nodeId} starting as ${this.role}`);
+    this.connectToPeers();
+    this.startConsensusLoop();
+    this.startKeepAlive();
+    this.initializeRoleServices();
+  }
 
   async connectToPeers() {
-  for (const peerUrl of NETWORK_CONFIG.peers) {
-    if (!peerUrl || peerUrl.includes(this.nodeId)) continue;
+    for (const peerUrl of NETWORK_CONFIG.peers) {
+      if (!peerUrl || peerUrl.includes(this.nodeId)) continue;
 
-    try {
-      const wsUrl = peerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
-      const ws = new WebSocket(wsUrl);
+      try {
+        const wsUrl = peerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+        const ws = new WebSocket(wsUrl);
 
-      ws.on('open', () => {
-        console.log(`🤝 Connected to peer: ${peerUrl}`);
-        this.peers.set(peerUrl, {
-          ws,
-          lastSeen: Date.now(),
-          health: 'connected',
-          nodeId: null // Will be set when we receive intro
+        ws.on('open', () => {
+          console.log(`🤝 Connected to peer: ${peerUrl}`);
+          this.peers.set(peerUrl, {
+            ws,
+            lastSeen: Date.now(),
+            health: 'connected',
+            nodeId: null // Will be set when we receive intro
+          });
+
+          this.sendToPeer(ws, {
+            type: 'node_intro',
+            nodeId: this.nodeId,
+            role: this.role,
+            timestamp: Date.now()
+          });
         });
 
-        this.sendToPeer(ws, {
-          type: 'node_intro',
-          nodeId: this.nodeId,
-          role: this.role,
-          timestamp: Date.now()
+        ws.on('message', (data) => this.handlePeerMessage(peerUrl, data));
+        ws.on('close', () => this.handlePeerDisconnect(peerUrl));
+        ws.on('error', (error) => {
+          console.log(`❌ WebSocket error for ${peerUrl}:`, error.message);
         });
-      });
 
-      ws.on('message', (data) => this.handlePeerMessage(peerUrl, data));
-      ws.on('close', () => this.handlePeerDisconnect(peerUrl));
-      ws.on('error', (error) => {
-        console.log(`❌ WebSocket error for ${peerUrl}:`, error.message);
-      });
-
-    } catch (error) {
-      console.log(`❌ Failed to connect to ${peerUrl}:`, error.message);
+      } catch (error) {
+        console.log(`❌ Failed to connect to ${peerUrl}:`, error.message);
+      }
     }
   }
-}
 
-startConsensusLoop() {
-  setInterval(() => {
-    this.performConsensusRound();
-  }, NETWORK_CONFIG.consensus.syncInterval);
+  startConsensusLoop() {
+    setInterval(() => {
+      this.performConsensusRound();
+    }, NETWORK_CONFIG.consensus.syncInterval);
 
-  setInterval(() => {
-    this.electLeader();
-  }, FIBONACCI[6] * 1000);
-}
+    setInterval(() => {
+      this.electLeader();
+    }, FIBONACCI[6] * 1000);
+  }
 
-startKeepAlive() {
-  setInterval(async () => {
+  startKeepAlive() {
+    setInterval(async () => {
+      try {
+        if (NETWORK_CONFIG.keepAlive.pingUrl) {
+          const response = await fetch(NETWORK_CONFIG.keepAlive.pingUrl + '/heartbeat');
+          console.log(`💓 Self-ping: ${response.status}`);
+        }
+        this.pingAllPeers();
+      } catch (error) {
+        console.log('⚠️ Keep-alive error:', error.message);
+      }
+    }, NETWORK_CONFIG.keepAlive.interval);
+  }
+
+  // ============= NOSTR EVENT METHODS =============
+
+  // ДОБАВИТЬ в класс DistributedStorage:
+  selectStorageNodes(eventId) {
+    const hash = crypto.createHash('sha256').update(eventId).digest('hex');
+    const nodeIndex = parseInt(hash.slice(0, 2), 16) % 2; // 0 или 1
+
+    const storageNodes = this.getActivePeers().filter(p => p.role === 'storage');
+
+    if (storageNodes.length >= 2) {
+      // Первичный узел для хранения
+      const primaryNode = nodeIndex === 0 ? 'storage-001' : 'storage-002';
+
+      // Репликация на второй узел для надежности
+      const replicaNode = nodeIndex === 0 ? 'storage-002' : 'storage-001';
+
+      return { primary: primaryNode, replica: replicaNode };
+    }
+
+    // Fallback: храним везде если недостаточно узлов
+    return { primary: this.nodeId, replica: null };
+  }
+
+
+  async addNostrEvent(event) {
     try {
-      if (NETWORK_CONFIG.keepAlive.pingUrl) {
-        const response = await fetch(NETWORK_CONFIG.keepAlive.pingUrl + '/heartbeat');
-        console.log(`💓 Self-ping: ${response.status}`);
-      }
-      this.pingAllPeers();
-    } catch (error) {
-      console.log('⚠️ Keep-alive error:', error.message);
-    }
-  }, NETWORK_CONFIG.keepAlive.interval);
-}
+      if (this.role === 'cache') {
+        const post = this.convertNostrEventToPost(event);
+        const eventAge = Date.now() - post.timestamp;
 
-// ============= NOSTR EVENT METHODS =============
-
-// ДОБАВИТЬ в класс DistributedStorage:
-selectStorageNodes(eventId) {
-  const hash = crypto.createHash('sha256').update(eventId).digest('hex');
-  const nodeIndex = parseInt(hash.slice(0, 2), 16) % 2; // 0 или 1
-
-  const storageNodes = this.getActivePeers().filter(p => p.role === 'storage');
-
-  if (storageNodes.length >= 2) {
-    // Первичный узел для хранения
-    const primaryNode = nodeIndex === 0 ? 'storage-001' : 'storage-002';
-
-    // Репликация на второй узел для надежности
-    const replicaNode = nodeIndex === 0 ? 'storage-002' : 'storage-001';
-
-    return { primary: primaryNode, replica: replicaNode };
-  }
-
-  // Fallback: храним везде если недостаточно узлов
-  return { primary: this.nodeId, replica: null };
-}
-
-
-async addNostrEvent(event) {
-  try {
-    if (this.role === 'cache') {
-      const post = this.convertNostrEventToPost(event);
-      const eventAge = Date.now() - post.timestamp;
-      
-      if (this.cacheType === 'hot') {
-        // cache-001: только свежие посты (24ч) + популярные
-        if (eventAge <= this.cacheTTL || post.likes.length >= 5) {
-          this.localData.set(event.id, post);
-          console.log(`🔥 cache-001 cached HOT event ${event.id.slice(0, 8)}...`);
+        if (this.cacheType === 'hot') {
+          // cache-001: только свежие посты (24ч) + популярные
+          if (eventAge <= this.cacheTTL || post.likes.length >= 5) {
+            this.localData.set(event.id, post);
+            console.log(`🔥 cache-001 cached HOT event ${event.id.slice(0, 8)}...`);
+          }
         }
-      } 
-      else if (this.cacheType === 'warm') {
-        // cache-002: посты до 7 дней
-        if (eventAge <= this.cacheTTL) {
-          this.localData.set(event.id, post);
-          console.log(`♨️ cache-002 cached WARM event ${event.id.slice(0, 8)}...`);
+        else if (this.cacheType === 'warm') {
+          // cache-002: посты до 7 дней
+          if (eventAge <= this.cacheTTL) {
+            this.localData.set(event.id, post);
+            console.log(`♨️ cache-002 cached WARM event ${event.id.slice(0, 8)}...`);
+          }
         }
-      }
-      
-      this.broadcastToPeers({
-        type: 'nostr_event',
-        event: event,
-        timestamp: Date.now(),
-        nodeId: this.nodeId
-      });
-      return true;
-    }
-    else if (this.role === 'storage') {
-      // Storage: проверяем должны ли мы хранить этот пост
-      const { primary, replica } = this.selectStorageNodes(event.id);
 
-      if (this.nodeId === primary || this.nodeId === replica) {
-        // Мы ответственны за этот пост
+        this.broadcastToPeers({
+          type: 'nostr_event',
+          event: event,
+          timestamp: Date.now(),
+          nodeId: this.nodeId
+        });
+        return true;
+      }
+      else if (this.role === 'storage') {
+        // Storage: проверяем должны ли мы хранить этот пост
+        const { primary, replica } = this.selectStorageNodes(event.id);
+
+        if (this.nodeId === primary || this.nodeId === replica) {
+          // Мы ответственны за этот пост
+          const post = this.convertNostrEventToPost(event);
+          this.localData.set(event.id, post);
+          console.log(`📦 ${this.nodeId} stored event ${event.id.slice(0, 8)}... (${this.nodeId === primary ? 'PRIMARY' : 'REPLICA'})`);
+        } else {
+          console.log(`⏭️ ${this.nodeId} skipped event ${event.id.slice(0, 8)}... (not our shard)`);
+        }
+
+        // Всегда транслируем дальше
+        this.broadcastToPeers({
+          type: 'nostr_event',
+          event: event,
+          timestamp: Date.now(),
+          nodeId: this.nodeId
+        });
+        return true;
+      }
+      else {
+        // Cache и другие узлы - обычная логика
         const post = this.convertNostrEventToPost(event);
         this.localData.set(event.id, post);
-        console.log(`📦 ${this.nodeId} stored event ${event.id.slice(0, 8)}... (${this.nodeId === primary ? 'PRIMARY' : 'REPLICA'})`);
+
+        this.broadcastToPeers({
+          type: 'nostr_event',
+          event: event,
+          timestamp: Date.now(),
+          nodeId: this.nodeId
+        });
+        return true;
+      }
+    } catch (error) {
+      console.error('❌ Error adding Nostr event:', error);
+      return false;
+    }
+  }
+
+  cleanupCacheData() {
+    if (this.role !== 'cache') return;
+
+    const now = Date.now();
+    const deleted = [];
+
+    for (const [id, post] of this.localData.entries()) {
+      const age = now - post.timestamp;
+      let shouldDelete = false;
+
+      if (this.cacheType === 'hot') {
+        // Удаляем если старше 24ч И непопулярные
+        shouldDelete = age > this.cacheTTL && post.likes.length < 5;
       } else {
-        console.log(`⏭️ ${this.nodeId} skipped event ${event.id.slice(0, 8)}... (not our shard)`);
+        // Удаляем если старше 7 дней
+        shouldDelete = age > this.cacheTTL;
       }
 
-      // Всегда транслируем дальше
-      this.broadcastToPeers({
-        type: 'nostr_event',
-        event: event,
-        timestamp: Date.now(),
-        nodeId: this.nodeId
-      });
-      return true;
+      if (shouldDelete) {
+        this.localData.delete(id);
+        deleted.push(id);
+      }
     }
-    else {
-      // Cache и другие узлы - обычная логика
-      const post = this.convertNostrEventToPost(event);
-      this.localData.set(event.id, post);
 
-      this.broadcastToPeers({
-        type: 'nostr_event',
-        event: event,
-        timestamp: Date.now(),
-        nodeId: this.nodeId
-      });
-      return true;
-    }
-  } catch (error) {
-    console.error('❌ Error adding Nostr event:', error);
-    return false;
-  }
-}
-
-cleanupCacheData() {
-  if (this.role !== 'cache') return;
-  
-  const now = Date.now();
-  const deleted = [];
-  
-  for (const [id, post] of this.localData.entries()) {
-    const age = now - post.timestamp;
-    let shouldDelete = false;
-    
-    if (this.cacheType === 'hot') {
-      // Удаляем если старше 24ч И непопулярные
-      shouldDelete = age > this.cacheTTL && post.likes.length < 5;
-    } else {
-      // Удаляем если старше 7 дней
-      shouldDelete = age > this.cacheTTL;
-    }
-    
-    if (shouldDelete) {
-      this.localData.delete(id);
-      deleted.push(id);
+    if (deleted.length > 0) {
+      console.log(`🗑️ ${this.nodeId} (${this.cacheType}) cleaned ${deleted.length} cached posts`);
     }
   }
-  
-  if (deleted.length > 0) {
-    console.log(`🗑️ ${this.nodeId} (${this.cacheType}) cleaned ${deleted.length} cached posts`);
-  }
-}
 
-async queryNostrEvents(filters) {
-  try {
-    if (this.role === 'gateway') {
-      return await this.queryFromOtherNodes(filters);
-    } else {
-      const events = [];
-      for (const [id, post] of this.localData.entries()) {
-        const event = this.convertPostToNostrEvent(post);
-        if (this.eventMatchesFilters(event, filters)) {
-          events.push(event);
+  async queryNostrEvents(filters) {
+    try {
+      if (this.role === 'gateway') {
+        return await this.queryFromOtherNodes(filters);
+      } else {
+        const events = [];
+        for (const [id, post] of this.localData.entries()) {
+          const event = this.convertPostToNostrEvent(post);
+          if (this.eventMatchesFilters(event, filters)) {
+            events.push(event);
+          }
         }
+        events.sort((a, b) => b.created_at - a.created_at);
+        const limit = filters[0]?.limit || 20;
+        return events.slice(0, limit);
       }
-      events.sort((a, b) => b.created_at - a.created_at);
-      const limit = filters[0]?.limit || 20;
-      return events.slice(0, limit);
+    } catch (error) {
+      console.error('❌ Error querying Nostr events:', error);
+      return [];
     }
-  } catch (error) {
-    console.error('❌ Error querying Nostr events:', error);
-    return [];
   }
-}
 
   async queryFromOtherNodes(filters) {
-  const activePeers = this.getActivePeers().filter(p =>
-    p.role === 'storage' || p.role === 'cache'
-  );
+    const activePeers = this.getActivePeers().filter(p =>
+      p.role === 'storage' || p.role === 'cache'
+    );
 
-  if (activePeers.length === 0) return [];
+    if (activePeers.length === 0) return [];
 
-  const targetPeer = activePeers[0];
+    const targetPeer = activePeers[0];
 
-  return new Promise((resolve) => {
-    const events = [];
+    return new Promise((resolve) => {
+      const events = [];
 
-    this.sendToPeer(targetPeer.ws, {
-      type: 'query_request',
-      filters: filters,
-      requestId: Date.now().toString()
+      this.sendToPeer(targetPeer.ws, {
+        type: 'query_request',
+        filters: filters,
+        requestId: Date.now().toString()
+      });
+
+      setTimeout(() => resolve(events), 5000);
     });
-
-    setTimeout(() => resolve(events), 5000);
-  });
-}
-
-convertNostrEventToPost(event) {
-  const titleTag = event.tags.find(tag => tag[0] === 'title');
-  const topicTag = event.tags.find(tag => tag[0] === 't');
-  const cityTag = event.tags.find(tag => tag[0] === 'city');
-  const genderTag = event.tags.find(tag => tag[0] === 'gender');
-  const ageTag = event.tags.find(tag => tag[0] === 'age');
-  const eventDateTag = event.tags.find(tag => tag[0] === 'event_date');
-
-  const lines = event.content.split('\n\n');
-  const title = titleTag?.[1] || lines[0] || 'Untitled';
-  const content = lines.slice(1).join('\n\n') || event.content;
-
-  return {
-    id: event.id,
-    title,
-    content,
-    author: `User_${event.pubkey.slice(-6)}`,
-    authorKey: event.pubkey,
-    authorInfo: {
-      name: `User_${event.pubkey.slice(-6)}`,
-      city: cityTag?.[1] || '',
-      gender: genderTag?.[1] || 'male',
-      age: ageTag?.[1] || ''
-    },
-    tag: topicTag?.[1] || 'general',
-    timestamp: event.created_at * 1000,
-    eventDate: eventDateTag?.[1] ? parseInt(eventDateTag[1]) : undefined,
-    likes: [],
-    replies: [],
-    reports: [],
-    isDraft: false
-  };
-}
-
-convertPostToNostrEvent(post) {
-  return {
-    id: post.id,
-    pubkey: post.authorKey,
-    created_at: Math.floor(post.timestamp / 1000),
-    kind: 1,
-    tags: [
-      ['t', post.tag],
-      ['title', post.title],
-      ['city', post.authorInfo.city || ''],
-      ['gender', post.authorInfo.gender || ''],
-      ['age', post.authorInfo.age || ''],
-      ...(post.eventDate ? [['event_date', post.eventDate.toString()]] : [])
-    ],
-    content: `${post.title}\n\n${post.content}`,
-    sig: 'placeholder_signature'
-  };
-}
-
-eventMatchesFilters(event, filters) {
-  for (const filter of filters) {
-    if (filter.kinds && !filter.kinds.includes(event.kind)) continue;
-    if (filter.authors && !filter.authors.includes(event.pubkey)) continue;
-    if (filter.since && event.created_at < filter.since) continue;
-    if (filter.until && event.created_at > filter.until) continue;
-    if (filter['#t'] && !event.tags.some(tag => tag[0] === 't' && filter['#t'].includes(tag[1]))) continue;
-
-    if (filter['#city'] && !event.tags.some(tag => tag[0] === 'city' && filter['#city'].includes(tag[1]))) continue;
-    if (filter['#gender'] && !event.tags.some(tag => tag[0] === 'gender' && filter['#gender'].includes(tag[1]))) continue;
-    if (filter['#age'] && !event.tags.some(tag => tag[0] === 'age' && filter['#age'].includes(tag[1]))) continue;
-
-    return true;
   }
-  return false;
-}
+
+  convertNostrEventToPost(event) {
+    const titleTag = event.tags.find(tag => tag[0] === 'title');
+    const topicTag = event.tags.find(tag => tag[0] === 't');
+    const cityTag = event.tags.find(tag => tag[0] === 'city');
+    const genderTag = event.tags.find(tag => tag[0] === 'gender');
+    const ageTag = event.tags.find(tag => tag[0] === 'age');
+    const eventDateTag = event.tags.find(tag => tag[0] === 'event_date');
+
+    const lines = event.content.split('\n\n');
+    const title = titleTag?.[1] || lines[0] || 'Untitled';
+    const content = lines.slice(1).join('\n\n') || event.content;
+
+    return {
+      id: event.id,
+      title,
+      content,
+      author: `User_${event.pubkey.slice(-6)}`,
+      authorKey: event.pubkey,
+      authorInfo: {
+        name: `User_${event.pubkey.slice(-6)}`,
+        city: cityTag?.[1] || '',
+        gender: genderTag?.[1] || 'male',
+        age: ageTag?.[1] || ''
+      },
+      tag: topicTag?.[1] || 'general',
+      timestamp: event.created_at * 1000,
+      eventDate: eventDateTag?.[1] ? parseInt(eventDateTag[1]) : undefined,
+      likes: [],
+      replies: [],
+      reports: [],
+      isDraft: false
+    };
+  }
+
+  convertPostToNostrEvent(post) {
+    return {
+      id: post.id,
+      pubkey: post.authorKey,
+      created_at: Math.floor(post.timestamp / 1000),
+      kind: 1,
+      tags: [
+        ['t', post.tag],
+        ['title', post.title],
+        ['city', post.authorInfo.city || ''],
+        ['gender', post.authorInfo.gender || ''],
+        ['age', post.authorInfo.age || ''],
+        ...(post.eventDate ? [['event_date', post.eventDate.toString()]] : [])
+      ],
+      content: `${post.title}\n\n${post.content}`,
+      sig: 'placeholder_signature'
+    };
+  }
+
+  eventMatchesFilters(event, filters) {
+    for (const filter of filters) {
+      if (filter.kinds && !filter.kinds.includes(event.kind)) continue;
+      if (filter.authors && !filter.authors.includes(event.pubkey)) continue;
+      if (filter.since && event.created_at < filter.since) continue;
+      if (filter.until && event.created_at > filter.until) continue;
+      if (filter['#t'] && !event.tags.some(tag => tag[0] === 't' && filter['#t'].includes(tag[1]))) continue;
+
+      if (filter['#city'] && !event.tags.some(tag => tag[0] === 'city' && filter['#city'].includes(tag[1]))) continue;
+      if (filter['#gender'] && !event.tags.some(tag => tag[0] === 'gender' && filter['#gender'].includes(tag[1]))) continue;
+      if (filter['#age'] && !event.tags.some(tag => tag[0] === 'age' && filter['#age'].includes(tag[1]))) continue;
+
+      return true;
+    }
+    return false;
+  }
 
   // ============= CONSENSUS PROTOCOL =============
 
   async performConsensusRound() {
-  const activePeers = this.getActivePeers();
+    const activePeers = this.getActivePeers();
 
-  if (activePeers.length < NETWORK_CONFIG.consensus.quorum - 1) {
-    console.log(`⚠️ Insufficient peers for consensus: ${activePeers.length}`);
-    return;
-  }
-
-  const proposal = {
-    type: 'consensus_proposal',
-    nodeId: this.nodeId,
-    version: this.state.version + 1,
-    changes: this.getPendingChanges(),
-    timestamp: Date.now()
-  };
-
-  this.broadcastToPeers(proposal);
-}
-
-electLeader() {
-  const activePeers = this.getActivePeers();
-  const candidates = [this.nodeId, ...activePeers.map(p => p.nodeId)].filter(Boolean).sort();
-  const leader = candidates[0];
-
-  const wasLeader = this.state.isLeader;
-  this.state.isLeader = (leader === this.nodeId);
-
-  if (this.state.isLeader && !wasLeader) {
-    console.log(`👑 Node ${this.nodeId} became leader`);
-    this.onBecomeLeader();
-  }
-}
-
-onBecomeLeader() {
-  this.startDataSynchronization();
-  this.startConflictResolution();
-  this.coordinateReplication();
-}
-
-// ============= PEER COMMUNICATION =============
-
-handlePeerMessage(peerUrl, data) {
-  try {
-    const message = JSON.parse(data.toString());
-
-    switch (message.type) {
-      case 'node_intro':
-        this.handleNodeIntro(peerUrl, message);
-        break;
-      case 'consensus_proposal':
-        this.handleConsensusProposal(message);
-        break;
-      case 'nostr_event':
-        this.handleNostrEvent(message);
-        break;
-      case 'data_sync':
-        this.handleDataSync(message);
-        break;
-      case 'heartbeat':
-        this.handleHeartbeat(peerUrl, message);
-        break;
-      case 'sync_request':
-        this.handleSyncRequest(peerUrl, message);
-        break;
-      case 'sync_response':
-        this.handleSyncResponse(message);
-        break;
-      case 'post_expired':
-        this.handlePostExpired(message);
-        break;
+    if (activePeers.length < NETWORK_CONFIG.consensus.quorum - 1) {
+      console.log(`⚠️ Insufficient peers for consensus: ${activePeers.length}`);
+      return;
     }
-  } catch (error) {
-    console.log('❌ Error handling peer message:', error);
+
+    const proposal = {
+      type: 'consensus_proposal',
+      nodeId: this.nodeId,
+      version: this.state.version + 1,
+      changes: this.getPendingChanges(),
+      timestamp: Date.now()
+    };
+
+    this.broadcastToPeers(proposal);
   }
-}
 
-handlePostExpired(message) {
-  if (this.localData.has(message.postId)) {
-    this.localData.delete(message.postId);
-    console.log(`🗑️ Removed expired post ${message.postId.slice(0, 8)}...`);
-  }
-}
+  electLeader() {
+    const activePeers = this.getActivePeers();
+    const candidates = [this.nodeId, ...activePeers.map(p => p.nodeId)].filter(Boolean).sort();
+    const leader = candidates[0];
 
-handleNodeIntro(peerUrl, message) {
-  const peer = this.peers.get(peerUrl);
-  if (peer) {
-    peer.nodeId = message.nodeId;
-    peer.role = message.role;
-    peer.lastSeen = Date.now();
-    console.log(`👋 Peer introduced: ${message.nodeId} (${message.role})`);
+    const wasLeader = this.state.isLeader;
+    this.state.isLeader = (leader === this.nodeId);
 
-    this.requestDataSync(peer.ws);
-  }
-}
-
-requestDataSync(ws) {
-  this.sendToPeer(ws, {
-    type: 'sync_request',
-    nodeId: this.nodeId,
-    since: Date.now() - (7 * 24 * 60 * 60 * 1000),
-    timestamp: Date.now()
-  });
-}
-
-handleConsensusProposal(message) {
-  // Handle consensus proposal
-  console.log(`📋 Consensus proposal from ${message.nodeId}`);
-  // TODO: Implement proper consensus handling
-}
-
-handleNostrEvent(message) {
-  try {
-    if (message.nodeId !== this.nodeId) {
-      // Store replicated event
-      const post = this.convertNostrEventToPost(message.event);
-      this.localData.set(message.event.id, post);
-      console.log(`📦 Received replicated event ${message.event.id.slice(0, 8)}...`);
-    }
-  } catch (error) {
-    console.log('❌ Error handling Nostr event:', error);
-  }
-}
-
-handleDataSync(message) {
-  console.log(`🔄 Data sync from ${message.nodeId}`);
-  // TODO: Implement data synchronization
-}
-
-handleHeartbeat(peerUrl, message) {
-  const peer = this.peers.get(peerUrl);
-  if (peer) {
-    peer.lastSeen = Date.now();
-    peer.health = message.health || 'unknown';
-  }
-}
-
-handleSyncRequest(peerUrl, message) {
-  const peer = this.peers.get(peerUrl);
-  if (!peer) return;
-
-  const events = [];
-  for (const [id, post] of this.localData.entries()) {
-    if (post.timestamp >= message.since) {
-      const event = this.convertPostToNostrEvent(post);
-      events.push(event);
+    if (this.state.isLeader && !wasLeader) {
+      console.log(`👑 Node ${this.nodeId} became leader`);
+      this.onBecomeLeader();
     }
   }
 
-  this.sendToPeer(peer.ws, {
-    type: 'sync_response',
-    nodeId: this.nodeId,
-    events: events,
-    timestamp: Date.now()
-  });
+  onBecomeLeader() {
+    this.startDataSynchronization();
+    this.startConflictResolution();
+    this.coordinateReplication();
+  }
 
-  console.log(`📤 Sent ${events.length} events to ${message.nodeId}`);
-}
+  // ============= PEER COMMUNICATION =============
 
-handleSyncResponse(message) {
-  console.log(`📥 Received ${message.events.length} events from ${message.nodeId}`);
+  handlePeerMessage(peerUrl, data) {
+    try {
+      const message = JSON.parse(data.toString());
 
-  message.events.forEach(event => {
-    if (!this.localData.has(event.id)) {
-      const post = this.convertNostrEventToPost(event);
-      this.localData.set(event.id, post);
+      switch (message.type) {
+        case 'node_intro':
+          this.handleNodeIntro(peerUrl, message);
+          break;
+        case 'consensus_proposal':
+          this.handleConsensusProposal(message);
+          break;
+        case 'nostr_event':
+          this.handleNostrEvent(message);
+          break;
+        case 'data_sync':
+          this.handleDataSync(message);
+          break;
+        case 'heartbeat':
+          this.handleHeartbeat(peerUrl, message);
+          break;
+        case 'sync_request':
+          this.handleSyncRequest(peerUrl, message);
+          break;
+        case 'sync_response':
+          this.handleSyncResponse(message);
+          break;
+        case 'post_expired':
+          this.handlePostExpired(message);
+          break;
+      }
+    } catch (error) {
+      console.log('❌ Error handling peer message:', error);
     }
-  });
-}
-
-sendToPeer(ws, message) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
   }
-}
 
-broadcastToPeers(message) {
-  for (const peer of this.peers.values()) {
-    this.sendToPeer(peer.ws, message);
+  handlePostExpired(message) {
+    if (this.localData.has(message.postId)) {
+      this.localData.delete(message.postId);
+      console.log(`🗑️ Removed expired post ${message.postId.slice(0, 8)}...`);
+    }
   }
-}
 
-pingAllPeers() {
-  const heartbeat = {
-    type: 'heartbeat',
-    nodeId: this.nodeId,
-    timestamp: Date.now(),
-    health: this.state.health
-  };
-  this.broadcastToPeers(heartbeat);
-}
+  handleNodeIntro(peerUrl, message) {
+    const peer = this.peers.get(peerUrl);
+    if (peer) {
+      peer.nodeId = message.nodeId;
+      peer.role = message.role;
+      peer.lastSeen = Date.now();
+      console.log(`👋 Peer introduced: ${message.nodeId} (${message.role})`);
 
-handlePeerDisconnect(peerUrl) {
-  console.log(`💔 Peer disconnected: ${peerUrl}`);
-  const peer = this.peers.get(peerUrl);
-  if (peer) {
-    peer.health = 'disconnected';
-    peer.lastSeen = Date.now();
+      this.requestDataSync(peer.ws);
+    }
   }
-}
 
-// ============= NETWORK HEALTH =============
-
-getActivePeers() {
-  const now = Date.now();
-  const timeout = 60000;
-
-  return Array.from(this.peers.entries())
-    .filter(([url, peer]) => {
-      const isRecentlySeen = now - peer.lastSeen < timeout;
-      const hasNodeId = peer.nodeId && peer.nodeId !== this.nodeId;
-      return isRecentlySeen && hasNodeId;
-    })
-    .map(([url, peer]) => ({ url, nodeId: peer.nodeId, role: peer.role, ...peer }));
-}
-
-// ============= ROLE-SPECIFIC SERVICES =============
-
-initializeRoleServices() {
-  switch (this.role) {
-    case 'master':
-      this.startMasterServices();
-      break;
-    case 'storage':
-      this.startStorageServices();
-      break;
-    case 'cache':
-      this.startCacheServices();
-      break;
-    case 'gateway':
-      this.startGatewayServices();
-      break;
+  requestDataSync(ws) {
+    this.sendToPeer(ws, {
+      type: 'sync_request',
+      nodeId: this.nodeId,
+      since: Date.now() - (7 * 24 * 60 * 60 * 1000),
+      timestamp: Date.now()
+    });
   }
-}
 
-startMasterServices() {
-  console.log('👑 Starting master node services');
-  setInterval(() => {
-    this.checkNetworkHealth();
-  }, FIBONACCI[7] * 1000);
-}
-
-startStorageServices() {
-  console.log('📦 Starting storage node services');
-}
-
-startCacheServices() {
-  console.log('⚡ Starting cache node services');
-  
-  // Определяем тип кеша по nodeId
-  if (this.nodeId === 'cache-001') {
-    this.cacheType = 'hot';   // Горячие данные (24ч + популярные)
-    this.cacheTTL = 24 * 60 * 60 * 1000; // 24 часа
-  } else {
-    this.cacheType = 'warm';  // Теплые данные (7 дней)
-    this.cacheTTL = 7 * 24 * 60 * 60 * 1000; // 7 дней
+  handleConsensusProposal(message) {
+    // Handle consensus proposal
+    console.log(`📋 Consensus proposal from ${message.nodeId}`);
+    // TODO: Implement proper consensus handling
   }
-  
-  console.log(`⚡ Cache type: ${this.cacheType}, TTL: ${this.cacheTTL}ms`);
-}
 
-startGatewayServices() {
-  console.log('🌐 Starting gateway node services');
-
-  // Gateway НЕ хранит данные, только перенаправляет
-  this.isProxy = true;
-  this.localData = new Map(); // Очищаем при старте
-
-  // Настраиваем маршрутизацию к Storage/Cache
-  this.setupDataRouting();
-}
-
-setupDataRouting() {
-  // Определяем куда отправлять запросы
-  this.storageNodes = this.getActivePeers().filter(p => p.role === 'storage');
-  this.cacheNodes = this.getActivePeers().filter(p => p.role === 'cache');
-}
-
-
-checkNetworkHealth() {
-  const activePeers = this.getActivePeers();
-  console.log(`💓 Network health: ${activePeers.length}/${NETWORK_CONFIG.peers.length} nodes active`);
-
-  if (activePeers.length < NETWORK_CONFIG.consensus.quorum - 1) {
-    console.log('⚠️ Network partition detected - entering degraded mode');
-    this.state.health = 'degraded';
-  } else {
-    this.state.health = 'healthy';
+  handleNostrEvent(message) {
+    try {
+      if (message.nodeId !== this.nodeId) {
+        // Store replicated event
+        const post = this.convertNostrEventToPost(message.event);
+        this.localData.set(message.event.id, post);
+        console.log(`📦 Received replicated event ${message.event.id.slice(0, 8)}...`);
+      }
+    } catch (error) {
+      console.log('❌ Error handling Nostr event:', error);
+    }
   }
-}
 
-// ============= UTILITY METHODS =============
+  handleDataSync(message) {
+    console.log(`🔄 Data sync from ${message.nodeId}`);
+    // TODO: Implement data synchronization
+  }
 
-getPendingChanges() {
-  return [];
-}
+  handleHeartbeat(peerUrl, message) {
+    const peer = this.peers.get(peerUrl);
+    if (peer) {
+      peer.lastSeen = Date.now();
+      peer.health = message.health || 'unknown';
+    }
+  }
 
-startDataSynchronization() {
-  console.log('🔄 Starting data synchronization');
-}
+  handleSyncRequest(peerUrl, message) {
+    const peer = this.peers.get(peerUrl);
+    if (!peer) return;
 
-startConflictResolution() {
-  console.log('⚖️ Starting conflict resolution');
-}
+    const events = [];
+    for (const [id, post] of this.localData.entries()) {
+      if (post.timestamp >= message.since) {
+        const event = this.convertPostToNostrEvent(post);
+        events.push(event);
+      }
+    }
 
-coordinateReplication() {
-  console.log('📡 Coordinating replication');
-}
+    this.sendToPeer(peer.ws, {
+      type: 'sync_response',
+      nodeId: this.nodeId,
+      events: events,
+      timestamp: Date.now()
+    });
+
+    console.log(`📤 Sent ${events.length} events to ${message.nodeId}`);
+  }
+
+  handleSyncResponse(message) {
+    console.log(`📥 Received ${message.events.length} events from ${message.nodeId}`);
+
+    message.events.forEach(event => {
+      if (!this.localData.has(event.id)) {
+        const post = this.convertNostrEventToPost(event);
+        this.localData.set(event.id, post);
+      }
+    });
+  }
+
+  sendToPeer(ws, message) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  }
+
+  broadcastToPeers(message) {
+    for (const peer of this.peers.values()) {
+      this.sendToPeer(peer.ws, message);
+    }
+  }
+
+  pingAllPeers() {
+    const heartbeat = {
+      type: 'heartbeat',
+      nodeId: this.nodeId,
+      timestamp: Date.now(),
+      health: this.state.health
+    };
+    this.broadcastToPeers(heartbeat);
+  }
+
+  handlePeerDisconnect(peerUrl) {
+    console.log(`💔 Peer disconnected: ${peerUrl}`);
+    const peer = this.peers.get(peerUrl);
+    if (peer) {
+      peer.health = 'disconnected';
+      peer.lastSeen = Date.now();
+    }
+  }
+
+  // ============= NETWORK HEALTH =============
+
+  getActivePeers() {
+    const now = Date.now();
+    const timeout = 60000;
+
+    return Array.from(this.peers.entries())
+      .filter(([url, peer]) => {
+        const isRecentlySeen = now - peer.lastSeen < timeout;
+        const hasNodeId = peer.nodeId && peer.nodeId !== this.nodeId;
+        return isRecentlySeen && hasNodeId;
+      })
+      .map(([url, peer]) => ({ url, nodeId: peer.nodeId, role: peer.role, ...peer }));
+  }
+
+  // ============= ROLE-SPECIFIC SERVICES =============
+
+  initializeRoleServices() {
+    switch (this.role) {
+      case 'master':
+        this.startMasterServices();
+        break;
+      case 'storage':
+        this.startStorageServices();
+        break;
+      case 'cache':
+        this.startCacheServices();
+        break;
+      case 'gateway':
+        this.startGatewayServices();
+        break;
+    }
+  }
+
+  startMasterServices() {
+    console.log('👑 Starting master node services');
+    setInterval(() => {
+      this.checkNetworkHealth();
+    }, FIBONACCI[7] * 1000);
+  }
+
+  startStorageServices() {
+    console.log('📦 Starting storage node services');
+  }
+
+  startCacheServices() {
+    console.log('⚡ Starting cache node services');
+
+    // Определяем тип кеша по nodeId
+    if (this.nodeId === 'cache-001') {
+      this.cacheType = 'hot';   // Горячие данные (24ч + популярные)
+      this.cacheTTL = 24 * 60 * 60 * 1000; // 24 часа
+    } else {
+      this.cacheType = 'warm';  // Теплые данные (7 дней)
+      this.cacheTTL = 7 * 24 * 60 * 60 * 1000; // 7 дней
+    }
+
+    console.log(`⚡ Cache type: ${this.cacheType}, TTL: ${this.cacheTTL}ms`);
+  }
+
+  startGatewayServices() {
+    console.log('🌐 Starting gateway node services');
+
+    // Gateway НЕ хранит данные, только перенаправляет
+    this.isProxy = true;
+    this.localData = new Map(); // Очищаем при старте
+
+    // Настраиваем маршрутизацию к Storage/Cache
+    this.setupDataRouting();
+  }
+
+  setupDataRouting() {
+    // Определяем куда отправлять запросы
+    this.storageNodes = this.getActivePeers().filter(p => p.role === 'storage');
+    this.cacheNodes = this.getActivePeers().filter(p => p.role === 'cache');
+  }
+
+
+  checkNetworkHealth() {
+    const activePeers = this.getActivePeers();
+    console.log(`💓 Network health: ${activePeers.length}/${NETWORK_CONFIG.peers.length} nodes active`);
+
+    if (activePeers.length < NETWORK_CONFIG.consensus.quorum - 1) {
+      console.log('⚠️ Network partition detected - entering degraded mode');
+      this.state.health = 'degraded';
+    } else {
+      this.state.health = 'healthy';
+    }
+  }
+
+  // ============= UTILITY METHODS =============
+
+  getPendingChanges() {
+    return [];
+  }
+
+  startDataSynchronization() {
+    console.log('🔄 Starting data synchronization');
+  }
+
+  startConflictResolution() {
+    console.log('⚖️ Starting conflict resolution');
+  }
+
+  coordinateReplication() {
+    console.log('📡 Coordinating replication');
+  }
 }
 
 // ========================= EXPRESS API LAYER =========================
@@ -939,10 +939,24 @@ class DistributedAPI {
 
       ws.on('message', async (data) => {
         try {
+          console.log('🔍 Raw message data:', data.toString());
           const message = JSON.parse(data.toString());
-          console.log('📨 Received Nostr message:', message[0]);
+          console.log('🔍 Parsed message:', message, 'Type:', typeof message, 'IsArray:', Array.isArray(message));
+
+          if (!Array.isArray(message)) {
+            console.error('❌ Invalid message format - not an array:', message);
+            ws.send(JSON.stringify(['NOTICE', 'Invalid message format - expected array']));
+            return;
+          }
+
+          if (message.length === 0) {
+            console.error('❌ Empty message array');
+            ws.send(JSON.stringify(['NOTICE', 'Empty message']));
+            return;
+          }
 
           const [type, ...params] = message;
+          console.log('📨 Nostr message type:', type, 'params:', params);
 
           switch (type) {
             case 'EVENT':
@@ -962,6 +976,7 @@ class DistributedAPI {
           }
         } catch (error) {
           console.error('❌ Error processing Nostr message:', error);
+          console.error('❌ Original data:', data.toString());
           ws.send(JSON.stringify(['NOTICE', 'Error processing message']));
         }
       });
