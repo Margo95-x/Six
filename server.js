@@ -79,21 +79,6 @@ class DistributedStorage {
     }, 6 * 60 * 60 * 1000);
   }
 
-  selectStorageNodes(eventId) {
-    const hash = crypto.createHash('sha256').update(eventId).digest('hex');
-    const nodeIndex = parseInt(hash.slice(0, 2), 16) % 2;
-
-    const storageNodes = this.getActivePeers().filter(p => p.role === 'storage');
-
-    if (storageNodes.length >= 2) {
-      const primaryNode = nodeIndex === 0 ? 'storage-001' : 'storage-002';
-      const replicaNode = nodeIndex === 0 ? 'storage-002' : 'storage-001';
-      return { primary: primaryNode, replica: replicaNode };
-    }
-
-    return { primary: this.nodeId, replica: null };
-  }
-
   cleanupOldPosts() {
     if (this.role === 'gateway') return;
 
@@ -184,7 +169,19 @@ class DistributedStorage {
       if (!peerUrl || peerUrl.includes(this.nodeId)) continue;
 
       try {
-        const wsUrl = peerUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+        let wsUrl = peerUrl;
+        if (peerUrl.startsWith('https://')) {
+          wsUrl = peerUrl.replace('https://', 'wss://');
+        } else if (peerUrl.startsWith('http://')) {
+          wsUrl = peerUrl.replace('http://', 'ws://');
+        }
+
+        if (!wsUrl.includes('/ws') && !wsUrl.endsWith('/')) {
+          wsUrl = wsUrl + '/ws';
+        }
+
+        console.log(`🔗 Attempting to connect to: ${wsUrl}`);
+
         const ws = new WebSocket(wsUrl);
 
         ws.on('open', () => {
@@ -193,7 +190,8 @@ class DistributedStorage {
             ws,
             lastSeen: Date.now(),
             health: 'connected',
-            nodeId: null // Will be set when we receive intro
+            nodeId: null,
+            role: null
           });
 
           this.sendToPeer(ws, {
@@ -208,6 +206,7 @@ class DistributedStorage {
         ws.on('close', () => this.handlePeerDisconnect(peerUrl));
         ws.on('error', (error) => {
           console.log(`❌ WebSocket error for ${peerUrl}:`, error.message);
+          setTimeout(() => this.reconnectToPeer(peerUrl), 5000);
         });
 
       } catch (error) {
@@ -250,19 +249,27 @@ class DistributedStorage {
     const storageNodes = this.getActivePeers().filter(p => p.role === 'storage');
 
     if (storageNodes.length >= 2) {
-      // Первичный узел для хранения
       const primaryNode = nodeIndex === 0 ? 'storage-001' : 'storage-002';
 
-      // Репликация на второй узел для надежности
       const replicaNode = nodeIndex === 0 ? 'storage-002' : 'storage-001';
 
       return { primary: primaryNode, replica: replicaNode };
     }
 
-    // Fallback: храним везде если недостаточно узлов
     return { primary: this.nodeId, replica: null };
   }
 
+  async reconnectToPeer(peerUrl) {
+    const peer = this.peers.get(peerUrl);
+    if (peer && peer.ws.readyState === WebSocket.CLOSED) {
+      console.log(`🔄 Attempting to reconnect to ${peerUrl}`);
+      this.peers.delete(peerUrl);
+
+      setTimeout(() => {
+        this.connectToPeers();
+      }, 2000);
+    }
+  }
 
   async addNostrEvent(event) {
     try {
@@ -366,7 +373,8 @@ class DistributedStorage {
   async queryNostrEvents(filters) {
     try {
       if (this.role === 'gateway') {
-        return await this.queryFromOtherNodes(filters);
+        const events = await this.queryFromOtherNodes(filters);
+        return events;
       } else {
         const events = [];
         for (const [id, post] of this.localData.entries()) {
@@ -375,7 +383,9 @@ class DistributedStorage {
             events.push(event);
           }
         }
+
         events.sort((a, b) => b.created_at - a.created_at);
+
         const limit = filters[0]?.limit || 20;
         return events.slice(0, limit);
       }
@@ -386,24 +396,55 @@ class DistributedStorage {
   }
 
   async queryFromOtherNodes(filters) {
-    const activePeers = this.getActivePeers().filter(p =>
-      p.role === 'storage' || p.role === 'cache'
-    );
+    const activePeers = this.getActivePeers();
 
-    if (activePeers.length === 0) return [];
+    const storagePeers = activePeers.filter(p => p.role === 'storage');
+    const cachePeers = activePeers.filter(p => p.role === 'cache');
+    const targetPeers = [...storagePeers, ...cachePeers];
 
-    const targetPeer = activePeers[0];
+    if (targetPeers.length === 0) {
+      console.log('⚠️ No storage/cache peers available for query');
+      return [];
+    }
 
     return new Promise((resolve) => {
-      const events = [];
+      const allEvents = new Map();
+      const requestId = Date.now().toString();
+      let responsesReceived = 0;
+      const expectedResponses = Math.min(3, targetPeers.length); // Опрашиваем до 3 узлов
 
-      this.sendToPeer(targetPeer.ws, {
-        type: 'query_request',
-        filters: filters,
-        requestId: Date.now().toString()
+      const timeoutId = setTimeout(() => {
+        console.log(`⏱️ Query timeout, received ${responsesReceived}/${expectedResponses} responses`);
+        resolve(Array.from(allEvents.values()));
+      }, 3000);
+
+      const handleQueryResponse = (message) => {
+        if (message.type === 'query_response' && message.requestId === requestId) {
+          responsesReceived++;
+
+          message.events.forEach(event => {
+            allEvents.set(event.id, event);
+          });
+
+          console.log(`📥 Received ${message.events.length} events from ${message.nodeId}`);
+
+          if (responsesReceived >= expectedResponses) {
+            clearTimeout(timeoutId);
+            resolve(Array.from(allEvents.values()));
+          }
+        }
+      };
+
+      this.queryResponseHandler = handleQueryResponse;
+
+      targetPeers.slice(0, expectedResponses).forEach(peer => {
+        this.sendToPeer(peer.ws, {
+          type: 'query_request',
+          filters: filters,
+          requestId: requestId,
+          nodeId: this.nodeId
+        });
       });
-
-      setTimeout(() => resolve(events), 5000);
     });
   }
 
@@ -414,6 +455,11 @@ class DistributedStorage {
     const genderTag = event.tags.find(tag => tag[0] === 'gender');
     const ageTag = event.tags.find(tag => tag[0] === 'age');
     const eventDateTag = event.tags.find(tag => tag[0] === 'event_date');
+    const appTag = event.tags.find(tag => tag[0] === 'app');
+
+    const authorNameTag = event.tags.find(tag => tag[0] === 'author_name');
+    const authorPhotoTag = event.tags.find(tag => tag[0] === 'author_photo');
+    const authorTypeTag = event.tags.find(tag => tag[0] === 'author_type');
 
     const lines = event.content.split('\n\n');
     const title = titleTag?.[1] || lines[0] || 'Untitled';
@@ -423,10 +469,11 @@ class DistributedStorage {
       id: event.id,
       title,
       content,
-      author: `User_${event.pubkey.slice(-6)}`,
+      author: authorNameTag?.[1] || `User_${event.pubkey.slice(-6)}`,
       authorKey: event.pubkey,
       authorInfo: {
-        name: `User_${event.pubkey.slice(-6)}`,
+        name: authorNameTag?.[1] || `User_${event.pubkey.slice(-6)}`,
+        photo_url: authorPhotoTag?.[1] || '',
         city: cityTag?.[1] || '',
         gender: genderTag?.[1] || 'male',
         age: ageTag?.[1] || ''
@@ -437,7 +484,8 @@ class DistributedStorage {
       likes: [],
       replies: [],
       reports: [],
-      isDraft: false
+      isDraft: false,
+      app: appTag?.[1] || 'nostr-social-feed'
     };
   }
 
@@ -453,6 +501,10 @@ class DistributedStorage {
         ['city', post.authorInfo.city || ''],
         ['gender', post.authorInfo.gender || ''],
         ['age', post.authorInfo.age || ''],
+        ['app', post.app || 'nostr-social-feed'],
+        ['author_name', post.author || ''],
+        ['author_photo', post.authorInfo.photo_url || ''],
+        ['author_type', 'demo'],
         ...(post.eventDate ? [['event_date', post.eventDate.toString()]] : [])
       ],
       content: `${post.title}\n\n${post.content}`,
@@ -524,9 +576,16 @@ class DistributedStorage {
     try {
       const message = JSON.parse(data.toString());
 
+      if (this.queryResponseHandler && message.type === 'query_response') {
+        this.queryResponseHandler(message);
+      }
+
       switch (message.type) {
         case 'node_intro':
           this.handleNodeIntro(peerUrl, message);
+          break;
+        case 'query_request':
+          this.handleQueryRequest(peerUrl, message);
           break;
         case 'consensus_proposal':
           this.handleConsensusProposal(message);
@@ -553,6 +612,31 @@ class DistributedStorage {
     } catch (error) {
       console.log('❌ Error handling peer message:', error);
     }
+  }
+
+  handleQueryRequest(peerUrl, message) {
+    const peer = this.peers.get(peerUrl);
+    if (!peer || this.role === 'gateway') return; // Gateway не отвечает на запросы
+
+    console.log(`📋 Received query request from ${message.nodeId}`);
+
+    const events = [];
+    for (const [id, post] of this.localData.entries()) {
+      const event = this.convertPostToNostrEvent(post);
+      if (this.eventMatchesFilters(event, message.filters)) {
+        events.push(event);
+      }
+    }
+
+    this.sendToPeer(peer.ws, {
+      type: 'query_response',
+      nodeId: this.nodeId,
+      requestId: message.requestId,
+      events: events,
+      timestamp: Date.now()
+    });
+
+    console.log(`📤 Sent ${events.length} events to ${message.nodeId}`);
   }
 
   handlePostExpired(message) {
@@ -583,19 +667,33 @@ class DistributedStorage {
     });
   }
 
-  handleConsensusProposal(message) {
-    // Handle consensus proposal
-    console.log(`📋 Consensus proposal from ${message.nodeId}`);
-    // TODO: Implement proper consensus handling
-  }
-
   handleNostrEvent(message) {
     try {
       if (message.nodeId !== this.nodeId) {
-        // Store replicated event
         const post = this.convertNostrEventToPost(message.event);
-        this.localData.set(message.event.id, post);
-        console.log(`📦 Received replicated event ${message.event.id.slice(0, 8)}...`);
+
+        if (this.role === 'storage') {
+          const { primary, replica } = this.selectStorageNodes(message.event.id);
+
+          if (this.nodeId === primary || this.nodeId === replica) {
+            this.localData.set(message.event.id, post);
+            console.log(`📦 Storage node ${this.nodeId} stored replicated event ${message.event.id.slice(0, 8)}...`);
+          }
+        } else if (this.role === 'cache') {
+          const eventAge = Date.now() - post.timestamp;
+
+          if (this.cacheType === 'hot' && (eventAge <= this.cacheTTL || post.likes.length >= 5)) {
+            this.localData.set(message.event.id, post);
+            console.log(`🔥 Cache stored HOT event ${message.event.id.slice(0, 8)}...`);
+          } else if (this.cacheType === 'warm' && eventAge <= this.cacheTTL) {
+            this.localData.set(message.event.id, post);
+            console.log(`♨️ Cache stored WARM event ${message.event.id.slice(0, 8)}...`);
+          }
+        } else if (this.role === 'master') {
+          this.localData.set(message.event.id, post);
+          console.log(`👑 Master stored event ${message.event.id.slice(0, 8)}...`);
+        }
+
       }
     } catch (error) {
       console.log('❌ Error handling Nostr event:', error);
@@ -620,6 +718,7 @@ class DistributedStorage {
     if (!peer) return;
 
     const events = [];
+
     for (const [id, post] of this.localData.entries()) {
       if (post.timestamp >= message.since) {
         const event = this.convertPostToNostrEvent(post);
@@ -634,7 +733,7 @@ class DistributedStorage {
       timestamp: Date.now()
     });
 
-    console.log(`📤 Sent ${events.length} events to ${message.nodeId}`);
+    console.log(`📤 Initial sync: sent ${events.length} events to ${message.nodeId}`);
   }
 
   handleSyncResponse(message) {
@@ -790,6 +889,8 @@ class DistributedStorage {
 
 // ========================= EXPRESS API LAYER =========================
 
+// ========================= EXPRESS API LAYER =========================
+
 class DistributedAPI {
   constructor(storage) {
     this.storage = storage;
@@ -829,7 +930,7 @@ class DistributedAPI {
         node: this.storage.nodeId,
         role: this.storage.role,
         network: `${this.storage.getActivePeers().length}/${NETWORK_CONFIG.peers.length} nodes`,
-        websocket: `wss://${req.headers.host}`,
+        websocket: `wss://${req.headers.host}/ws`, // Добавлен путь /ws
         status: this.storage.state.health
       });
     });
@@ -924,18 +1025,18 @@ class DistributedAPI {
     });
   }
 
-  start(port = 8080) {
-    const server = this.app.listen(port, '0.0.0.0', () => {
-      console.log(`🌊 Distributed node ${this.storage.nodeId} (${this.storage.role}) running on port ${port}`);
+  // Правильный метод setupWebSocketServer - отдельный метод класса
+  setupWebSocketServer(server) {
+    this.wss = new WebSocketServer({
+      server,
+      path: '/ws' // Явно указываем путь
     });
 
-    // WebSocket server for Nostr protocol
-    this.wss = new WebSocketServer({ server });
-
     this.wss.on('connection', (ws, req) => {
-      console.log(`🔌 Client connected to ${this.storage.role} node`);
+      const clientIp = req.socket.remoteAddress;
+      console.log(`🔌 Client connected from ${clientIp} to ${this.storage.role} node`);
 
-      ws.send(JSON.stringify(['NOTICE', 'Connected to distributed Nostr relay']));
+      ws.send(JSON.stringify(['NOTICE', `Connected to distributed Nostr relay (${this.storage.role} node)`]));
 
       ws.on('message', async (data) => {
         try {
@@ -989,6 +1090,16 @@ class DistributedAPI {
         console.error('❌ WebSocket error:', error);
       });
     });
+  }
+
+  // Правильный метод start - один раз
+  start(port = 8080) {
+    const server = this.app.listen(port, '0.0.0.0', () => {
+      console.log(`🌊 Distributed node ${this.storage.nodeId} (${this.storage.role}) running on port ${port}`);
+    });
+
+    // Настраиваем WebSocket сервер
+    this.setupWebSocketServer(server);
 
     return server;
   }
