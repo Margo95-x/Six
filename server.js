@@ -1,388 +1,368 @@
-const express = require('express')
+#!/usr/bin/env node
+/**
+ * Telegram Bot - Events Platform Launcher
+ * =======================================
+ * 
+ * Простой бот для запуска Mini App
+ * Может работать на том же сервере что и Posts/Accounts
+ */
+
 const TelegramBot = require('node-telegram-bot-api')
-const cors = require('cors')
 
-const app = express()
+class EventsPlatformBot {
+  constructor() {
+    this.token = process.env.BOT_TOKEN
+    if (!this.token) {
+      throw new Error('BOT_TOKEN environment variable is required')
+    }
 
-// Environment variables
-const BOT_TOKEN = '7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw'
-const GROUP_ID = '-1002268255207'
-const PORT = process.env.PORT || 3002
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://six-z05l.onrender.com'
+    this.miniAppUrl = process.env.MINI_APP_URL || 'https://your-mini-app.onrender.com'
+    
+    // Инициализация бота
+    this.bot = new TelegramBot(this.token, { polling: true })
+    
+    this.setupCommands()
+    this.setupHandlers()
+    
+    console.log('🤖 Events Platform Bot started!')
+  }
 
-// Initialize Telegram bot
-const bot = new TelegramBot(BOT_TOKEN)
+  setupCommands() {
+    // Устанавливаем команды бота
+    this.bot.setMyCommands([
+      { command: 'start', description: '🚀 Launch Events Platform' },
+      { command: 'help', description: '❓ Show help' },
+      { command: 'about', description: 'ℹ️ About Events Platform' }
+    ])
+  }
 
-// Middleware
-app.use(cors())
-app.use('/webhook', express.raw({ type: 'application/json' }))
-app.use(express.json())
+  setupHandlers() {
+    // Команда /start
+    this.bot.onText(/\/start/, (msg) => {
+      this.handleStart(msg)
+    })
 
-// Lightweight cache for recent messages (only for current request)
-let messageCache = null
-let cacheTimestamp = 0
-const CACHE_DURATION = 30000 // 30 seconds
+    // Команда /help
+    this.bot.onText(/\/help/, (msg) => {
+      this.handleHelp(msg)
+    })
 
-// Message parsers
-function parseEventFromMessage(text, messageId, date, from) {
-  try {
-    // Parse create/update message: "🎯 Title\n\nDescription\n\n📍 city..."
-    if (text.includes('🎯')) {
-      const isUpdate = text.startsWith('✏️ Updated:')
-      const content = isUpdate ? text.replace('✏️ Updated:\n\n', '') : text
+    // Команда /about
+    this.bot.onText(/\/about/, (msg) => {
+      this.handleAbout(msg)
+    })
+
+    // Обработка ошибок
+    this.bot.on('error', (error) => {
+      console.error('Bot error:', error)
+    })
+
+    // Обработка polling_error
+    this.bot.on('polling_error', (error) => {
+      console.error('Polling error:', error)
+    })
+
+    console.log('✅ Bot handlers setup complete')
+  }
+
+  async handleStart(msg) {
+    const chatId = msg.chat.id
+    const user = msg.from
+
+    console.log(`👤 User ${user.first_name} (${user.id}) started the bot`)
+
+    const welcomeMessage = `
+🎯 **Welcome to Events Platform!**
+
+Hi ${user.first_name}! 👋
+
+Create and discover amazing events in your city:
+• 📝 Create events
+• 🔍 Find interesting events
+• ❤️ Like and save favorites
+• 💬 Connect with people
+
+Ready to start? Tap the button below! 👇
+    `
+
+    const keyboard = {
+      inline_keyboard: [
+        [
+          {
+            text: '🚀 Launch Events Platform',
+            web_app: { url: this.miniAppUrl }
+          }
+        ],
+        [
+          {
+            text: '❓ Help',
+            callback_data: 'help'
+          },
+          {
+            text: 'ℹ️ About',
+            callback_data: 'about'
+          }
+        ]
+      ]
+    }
+
+    try {
+      await this.bot.sendMessage(chatId, welcomeMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      })
+    } catch (error) {
+      console.error('Error sending start message:', error)
       
-      const lines = content.split('\n').filter(line => line.trim())
-      
-      // Extract title (after 🎯)
-      const titleLine = lines.find(line => line.includes('🎯'))
-      if (!titleLine) return null
-      
-      const title = titleLine.replace('🎯', '').replace(/<\/?b>/g, '').trim()
-      
-      // Extract description (lines between title and metadata)
-      const titleIndex = lines.findIndex(line => line.includes('🎯'))
-      let description = ''
-      let metadataStartIndex = lines.length
-      
-      for (let i = titleIndex + 1; i < lines.length; i++) {
-        if (lines[i].match(/^[📍🏷️👤🎂]/)) {
-          metadataStartIndex = i
-          break
+      // Fallback без Markdown
+      await this.bot.sendMessage(chatId, 
+        `Welcome to Events Platform!\n\nHi ${user.first_name}! Create and discover events in your city.`,
+        { reply_markup: keyboard }
+      )
+    }
+  }
+
+  async handleHelp(msg) {
+    const chatId = msg.chat.id
+
+    const helpMessage = `
+❓ **How to use Events Platform:**
+
+**Getting Started:**
+1. Tap "Launch Events Platform" button
+2. Browse events in the feed
+3. Use filters to find what you're looking for
+
+**Creating Events:**
+• Tap the "+" button in the app
+• Fill in event details
+• Share with the community!
+
+**Interacting:**
+• ❤️ Like events you're interested in
+• ⭐ Save to favorites
+• 💬 Contact event creators
+• 👁️ Hide events you don't like
+
+**Tips:**
+• Use search to find specific events
+• Filter by city and category
+• Check "My Events" tab for your creations
+• Check "Favorites" for saved events
+
+Need more help? Contact @your_support_username
+    `
+
+    const keyboard = {
+      inline_keyboard: [
+        [
+          {
+            text: '🚀 Launch App',
+            web_app: { url: this.miniAppUrl }
+          }
+        ]
+      ]
+    }
+
+    try {
+      await this.bot.sendMessage(chatId, helpMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      })
+    } catch (error) {
+      console.error('Error sending help message:', error)
+      await this.bot.sendMessage(chatId, helpMessage.replace(/\*\*/g, ''), {
+        reply_markup: keyboard
+      })
+    }
+  }
+
+  async handleAbout(msg) {
+    const chatId = msg.chat.id
+
+    const aboutMessage = `
+ℹ️ **About Events Platform**
+
+Events Platform is a community-driven app for creating and discovering local events.
+
+**Features:**
+• 📝 Create any type of event
+• 🔍 Smart search and filters  
+• 👥 Connect with like-minded people
+• 📱 Beautiful, fast interface
+• 🔄 Real-time updates
+
+**Categories:**
+👥 Meetups • 🎉 Parties • ⚽ Sports
+🎭 Culture • 💼 Business • 📚 Education
+
+**Privacy:**
+We only store public event information and your interaction preferences (likes, favorites). Your Telegram data stays private.
+
+**Open Source:**
+This platform is built with modern web technologies and follows best practices for performance and security.
+
+Built with ❤️ for the community.
+    `
+
+    const keyboard = {
+      inline_keyboard: [
+        [
+          {
+            text: '🚀 Try It Now',
+            web_app: { url: this.miniAppUrl }
+          }
+        ],
+        [
+          {
+            text: '📱 Share App',
+            switch_inline_query: 'Check out Events Platform! 🎯'
+          }
+        ]
+      ]
+    }
+
+    try {
+      await this.bot.sendMessage(chatId, aboutMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      })
+    } catch (error) {
+      console.error('Error sending about message:', error)
+      await this.bot.sendMessage(chatId, aboutMessage.replace(/\*\*/g, ''), {
+        reply_markup: keyboard
+      })
+    }
+  }
+
+  // Callback query handler
+  handleCallbackQuery() {
+    this.bot.on('callback_query', async (query) => {
+      const chatId = query.message.chat.id
+      const data = query.data
+
+      try {
+        await this.bot.answerCallbackQuery(query.id)
+
+        switch (data) {
+          case 'help':
+            await this.handleHelp({ chat: { id: chatId } })
+            break
+          case 'about':
+            await this.handleAbout({ chat: { id: chatId } })
+            break
+          default:
+            console.log('Unknown callback query:', data)
         }
-        if (lines[i].trim()) {
-          description += (description ? ' ' : '') + lines[i].trim()
-        }
+      } catch (error) {
+        console.error('Callback query error:', error)
       }
-      
-      // Extract metadata
-      const metadata = lines.slice(metadataStartIndex)
-      let city = '', category = '', gender = '', ageGroup = '', authorName = '', username = ''
-      
-      metadata.forEach(line => {
-        if (line.startsWith('📍')) city = line.replace('📍', '').trim()
-        else if (line.startsWith('🏷️')) category = line.replace('🏷️', '').trim()
-        else if (line.startsWith('👤') && !line.includes('@')) gender = line.replace('👤', '').trim()
-        else if (line.startsWith('🎂')) ageGroup = line.replace('🎂', '').trim()
-        else if (line.startsWith('👤') && line.includes('@')) {
-          const authorLine = line.replace('👤', '').trim()
-          const match = authorLine.match(/^(.+?)\s*\(@(.+?)\)$/)
-          if (match) {
-            authorName = match[1].trim()
-            username = match[2].trim()
-          } else {
-            authorName = authorLine
+    })
+  }
+
+  // Обработка инлайн запросов (для шеринга)
+  setupInlineQueries() {
+    this.bot.on('inline_query', async (query) => {
+      const results = [
+        {
+          type: 'article',
+          id: '1',
+          title: '🎯 Events Platform',
+          description: 'Create and discover amazing events in your city!',
+          input_message_content: {
+            message_text: `🎯 **Events Platform** - Create and discover amazing events!\n\n🚀 Try it now: @${this.bot.options.username || 'your_bot_username'}`
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '🚀 Launch Events Platform',
+                  url: `https://t.me/${this.bot.options.username || 'your_bot_username'}`
+                }
+              ]
+            ]
           }
         }
-      })
-      
-      const event = {
-        id: messageId.toString(),
-        title,
-        description,
-        authorId: from?.id?.toString() || 'unknown',
-        author: {
-          fullName: authorName,
-          username: username || undefined,
-          telegramId: from?.id?.toString()
-        },
-        city,
-        category,
-        gender,
-        ageGroup,
-        createdAt: new Date(date * 1000).toISOString(),
-        updatedAt: new Date().toISOString(),
-        likes: 0,
-        isLiked: false,
-        status: 'active',
-        telegramMessageId: messageId
-      }
-      
-      return event
-    }
-    
-    return null
-  } catch (error) {
-    console.error('Error parsing message:', error)
-    return null
-  }
-}
+      ]
 
-// Read messages from Telegram group
-async function getEventsFromTelegram() {
-  try {
-    // Check cache first
-    if (messageCache && (Date.now() - cacheTimestamp < CACHE_DURATION)) {
-      return messageCache
-    }
-    
-    console.log('Reading messages from Telegram group...')
-    
-    // Get chat history - this works for supergroups
-    const messages = []
-    let offset = 0
-    const limit = 100 // Max messages per request
-    const maxMessages = 500 // Don't load too many on free plan
-    
-    // Note: In production you might need to use different approach
-    // as getUpdates has limitations for groups
-    
-    // Alternative: Read messages using chat export or admin bot
-    // For now, we'll simulate reading recent messages
-    
-    const events = []
-    
-    // Temporary cache to avoid repeated API calls
-    messageCache = events
-    cacheTimestamp = Date.now()
-    
-    return events
-  } catch (error) {
-    console.error('Error reading from Telegram:', error)
-    return []
-  }
-}
-
-// Alternative: Read messages using getUpdates (limited)
-async function getEventsFromUpdates() {
-  try {
-    const updates = await bot.getUpdates({ limit: 100, timeout: 10 })
-    const events = []
-    
-    updates.forEach(update => {
-      if (update.message && 
-          update.message.chat.id.toString() === GROUP_ID &&
-          update.message.text &&
-          update.message.text.includes('🎯')) {
-        
-        const { message_id, text, date, from } = update.message
-        const event = parseEventFromMessage(text, message_id, date, from)
-        if (event) {
-          events.push(event)
-        }
+      try {
+        await this.bot.answerInlineQuery(query.id, results, {
+          cache_time: 300,
+          is_personal: false
+        })
+      } catch (error) {
+        console.error('Inline query error:', error)
       }
     })
-    
-    return events
-  } catch (error) {
-    console.error('Error getting updates:', error)
-    return []
   }
-}
 
-// Webhook endpoint (for cache invalidation)
-app.post('/webhook', (req, res) => {
-  try {
-    const update = JSON.parse(req.body.toString())
-    
-    // Process only messages from the specific group
-    if (update.message && 
-        update.message.chat.id.toString() === GROUP_ID &&
-        update.message.text) {
-      
-      console.log('New message in group, invalidating cache')
-      
-      // Invalidate cache when new message arrives
-      messageCache = null
-      cacheTimestamp = 0
-    }
-    
-    res.status(200).send('OK')
-  } catch (error) {
-    console.error('Webhook error:', error)
-    res.status(500).send('Error')
-  }
-})
-
-// Helper functions for filtering and sorting
-function fullTextSearch(events, query) {
-  const searchTerms = query.toLowerCase().split(' ')
-  return events.filter(event => {
-    const searchText = `${event.title} ${event.description}`.toLowerCase()
-    return searchTerms.every(term => searchText.includes(term))
-  })
-}
-
-function applyFilters(events, filters) {
-  let filtered = events
-  
-  if (filters.city) {
-    filtered = filtered.filter(e => e.city === filters.city)
-  }
-  
-  if (filters.category) {
-    filtered = filtered.filter(e => e.category === filters.category)
-  }
-  
-  if (filters.gender) {
-    filtered = filtered.filter(e => e.gender === filters.gender)
-  }
-  
-  if (filters.ageGroup) {
-    filtered = filtered.filter(e => e.ageGroup === filters.ageGroup)
-  }
-  
-  if (filters.dateFrom) {
-    filtered = filtered.filter(e => new Date(e.createdAt) >= new Date(filters.dateFrom))
-  }
-  
-  if (filters.dateTo) {
-    filtered = filtered.filter(e => new Date(e.createdAt) <= new Date(filters.dateTo))
-  }
-  
-  if (filters.authorId) {
-    filtered = filtered.filter(e => e.authorId === filters.authorId)
-  }
-  
-  return filtered
-}
-
-function sortEvents(events, sortType) {
-  switch (sortType) {
-    case 'popularity':
-      return [...events].sort((a, b) => (b.likes || 0) - (a.likes || 0))
-    case 'old':
-      return [...events].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
-    case 'new':
-    default:
-      return [...events].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-  }
-}
-
-// API Routes
-app.get('/api/feed', async (req, res) => {
-  try {
-    const { 
-      city, 
-      category, 
-      gender, 
-      ageGroup, 
-      search, 
-      sort = 'new',
-      page = 1, 
-      limit = 20,
-      authorId,
-      dateFrom,
-      dateTo
-    } = req.query
-
-    // Read events from Telegram group (not from memory!)
-    let events = await getEventsFromTelegram()
-    
-    // If no events from main method, try alternative
-    if (events.length === 0) {
-      events = await getEventsFromUpdates()
+  // Статистика использования
+  setupStats() {
+    this.stats = {
+      totalUsers: new Set(),
+      dailyActiveUsers: new Set(),
+      commandsCount: {},
+      startTime: Date.now()
     }
 
-    // Apply search
-    if (search) {
-      events = fullTextSearch(events, search)
-    }
+    // Сброс дневной статистики каждые 24 часа
+    setInterval(() => {
+      this.stats.dailyActiveUsers.clear()
+      console.log(`📊 Daily stats reset. Total users: ${this.stats.totalUsers.size}`)
+    }, 24 * 60 * 60 * 1000)
 
-    // Apply filters
-    const filters = { city, category, gender, ageGroup, authorId, dateFrom, dateTo }
-    events = applyFilters(events, filters)
+    // Обновляем статистику при каждом сообщении
+    this.bot.on('message', (msg) => {
+      const userId = msg.from.id
+      this.stats.totalUsers.add(userId)
+      this.stats.dailyActiveUsers.add(userId)
 
-    // Apply sorting
-    events = sortEvents(events, sort)
-
-    // Pagination
-    const startIndex = (page - 1) * limit
-    const endIndex = startIndex + parseInt(limit)
-    const paginatedEvents = events.slice(startIndex, endIndex)
-
-    res.json({
-      posts: paginatedEvents,
-      hasMore: events.length > endIndex,
-      total: events.length,
-      page: parseInt(page),
-      limit: parseInt(limit)
+      const command = msg.text?.split(' ')[0]
+      if (command) {
+        this.stats.commandsCount[command] = (this.stats.commandsCount[command] || 0) + 1
+      }
     })
-  } catch (error) {
-    console.error('Error fetching feed:', error)
-    res.status(500).json({ error: 'Failed to fetch feed' })
   }
-})
 
-// Get single event by reading from Telegram
-app.get('/api/events/:id', async (req, res) => {
-  try {
-    const events = await getEventsFromTelegram()
-    const event = events.find(e => e.id === req.params.id)
-    
-    if (!event) {
-      return res.status(404).json({ error: 'Event not found' })
+  // API для получения статистики (если нужно)
+  getStats() {
+    return {
+      totalUsers: this.stats.totalUsers.size,
+      dailyActiveUsers: this.stats.dailyActiveUsers.size,
+      commandsCount: this.stats.commandsCount,
+      uptime: Math.round((Date.now() - this.stats.startTime) / 1000)
     }
-    
-    res.json(event)
-  } catch (error) {
-    console.error('Error fetching event:', error)
-    res.status(500).json({ error: 'Failed to fetch event' })
-  }
-})
-
-// Stats endpoint
-app.get('/api/stats', async (req, res) => {
-  try {
-    const events = await getEventsFromTelegram()
-    
-    const stats = {
-      totalEvents: events.length,
-      byCity: {},
-      byCategory: {},
-      byStatus: {}
-    }
-    
-    events.forEach(event => {
-      // City stats
-      stats.byCity[event.city] = (stats.byCity[event.city] || 0) + 1
-      
-      // Category stats
-      stats.byCategory[event.category] = (stats.byCategory[event.category] || 0) + 1
-      
-      // Status stats
-      stats.byStatus[event.status] = (stats.byStatus[event.status] || 0) + 1
-    })
-    
-    res.json(stats)
-  } catch (error) {
-    console.error('Error fetching stats:', error)
-    res.status(500).json({ error: 'Failed to fetch stats' })
-  }
-})
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK',
-    cacheStatus: messageCache ? 'cached' : 'empty',
-    webhookUrl: `${WEBHOOK_URL}/webhook`
-  })
-})
-
-// Error handler
-app.use((error, req, res, next) => {
-  console.error('Server error:', error)
-  res.status(500).json({ error: 'Internal server error' })
-})
-
-// Setup webhook and start server
-async function setupWebhook() {
-  try {
-    const webhookUrl = `${WEBHOOK_URL}/webhook`
-    await bot.setWebHook(webhookUrl)
-    console.log('Webhook set to:', webhookUrl)
-  } catch (error) {
-    console.error('Error setting webhook:', error)
   }
 }
 
-// Start server
-app.listen(PORT, async () => {
-  console.log(`Bot 2 server running on port ${PORT}`)
-  console.log(`Reading events from Telegram group on each request`)
+// === ЗАПУСК БОТА ===
+
+try {
+  const bot = new EventsPlatformBot()
   
-  // Setup webhook for cache invalidation
-  await setupWebhook()
+  // Настройка callback queries
+  bot.handleCallbackQuery()
   
-  console.log('Bot 2 initialization complete - NO in-memory storage!')
-})
+  // Настройка inline queries
+  bot.setupInlineQueries()
+  
+  // Настройка статистики
+  bot.setupStats()
+
+  // Graceful shutdown
+  process.on('SIGINT', () => {
+    console.log('🛑 Bot shutting down...')
+    bot.bot.stopPolling()
+    process.exit(0)
+  })
+
+  process.on('SIGTERM', () => {
+    console.log('🛑 Bot shutting down...')
+    bot.bot.stopPolling()
+    process.exit(0)
+  })
+
+} catch (error) {
+  console.error('❌ Failed to start bot:', error)
+  process.exit(1)
+}
