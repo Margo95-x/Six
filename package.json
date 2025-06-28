@@ -2,9 +2,9 @@
   "name": "telegram-main-bot",
   "version": "1.0.0",
   "description": "Simple bot with language selection buttons",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",
