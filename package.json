@@ -1,33 +1,16 @@
 {
-  "name": "events-telegram-bot",
+  "name": "telegram-main-bot",
   "version": "1.0.0",
-  "description": "Events Platform - Telegram Bot Launcher",
-  "main": "bot.js",
+  "description": "Simple bot with language selection buttons",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js",
-    "test": "echo \"No tests specified\" && exit 0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "express": "^4.18.2"
   },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
-  },
-  "keywords": [
-    "telegram",
-    "bot",
-    "mini-app",
-    "events",
-    "launcher"
-  ],
-  "author": "Events Platform",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/your-username/events-telegram-bot.git"
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
