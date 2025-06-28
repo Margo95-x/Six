@@ -1,42 +1,28 @@
 const TelegramBot = require('node-telegram-bot-api');
-const express = require('express');
 
 // Конфигурация
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const RUSSIAN_GROUP_URL = process.env.RUSSIAN_GROUP_URL;
-const ENGLISH_GROUP_URL = process.env.ENGLISH_GROUP_URL;
-const PORT = process.env.PORT || 3000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const RUSSIAN_GROUP_URL = process.env.RUSSIAN_GROUP_URL || 'https://t.me/russian_group';
+const ENGLISH_GROUP_URL = process.env.ENGLISH_GROUP_URL || 'https://t.me/english_group';
 
-console.log('=== ОСНОВНОЙ БОТ ===');
+console.log('=== ПРОСТОЙ БОТ ===');
 console.log('BOT_TOKEN:', BOT_TOKEN ? 'установлен' : 'НЕ УСТАНОВЛЕН');
-console.log('RUSSIAN_GROUP_URL:', RUSSIAN_GROUP_URL ? 'установлен' : 'НЕ УСТАНОВЛЕН');
-console.log('ENGLISH_GROUP_URL:', ENGLISH_GROUP_URL ? 'установлен' : 'НЕ УСТАНОВЛЕН');
 
-// Инициализация
-const bot = new TelegramBot(BOT_TOKEN);
-const app = express();
-
-app.use(express.json());
-
-// Настройка webhook или polling
-if (WEBHOOK_URL) {
-    bot.setWebHook(`${WEBHOOK_URL}/bot${BOT_TOKEN}`);
-    app.post(`/bot${BOT_TOKEN}`, (req, res) => {
-        bot.processUpdate(req.body);
-        res.sendStatus(200);
-    });
-    console.log('✅ Webhook режим');
-} else {
-    bot.startPolling();
-    console.log('✅ Polling режим');
+if (!BOT_TOKEN) {
+    console.error('❌ BOT_TOKEN не установлен!');
+    process.exit(1);
 }
 
-// Единственная команда - старт
+// Инициализация бота (только polling, без webhook)
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+console.log('✅ Бот инициализирован');
+
+// Команда старт - единственная функция
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     
-    console.log(`[START] Пользователь ${msg.from.first_name} запустил бота`);
+    console.log(`[START] Пользователь ${msg.from.first_name} (${msg.from.id}) запустил бота`);
     
     const keyboard = {
         inline_keyboard: [[
@@ -45,48 +31,74 @@ bot.onText(/\/start/, async (msg) => {
         ]]
     };
     
-    await bot.sendMessage(chatId, 'Выберите язык:', { 
-        reply_markup: keyboard 
-    });
+    try {
+        await bot.sendMessage(chatId, 'Выберите язык:', { 
+            reply_markup: keyboard 
+        });
+        console.log(`[SUCCESS] Кнопки отправлены пользователю ${msg.from.id}`);
+    } catch (error) {
+        console.error(`[ERROR] Ошибка отправки кнопок:`, error.message);
+    }
 });
 
-// Игнорируем все остальные сообщения - бот только показывает кнопки
+// Игнорируем все остальные сообщения
 bot.on('message', (msg) => {
-    // Игнорируем все сообщения кроме /start
     if (!msg.text?.startsWith('/start')) {
+        // Просто игнорируем, не отвечаем
         return;
     }
 });
 
-// Минимальная обработка ошибок
+// Обработка ошибок
 bot.on('error', (error) => {
-    console.error('[BOT ERROR]', error);
+    console.error('[BOT ERROR]', error.message);
 });
 
 bot.on('polling_error', (error) => {
-    console.error('[POLLING ERROR]', error);
+    console.error('[POLLING ERROR]', error.message);
+    
+    if (error.message.includes('401')) {
+        console.error('❌ НЕПРАВИЛЬНЫЙ ТОКЕН БОТА! Проверьте BOT_TOKEN');
+    }
+    if (error.message.includes('409')) {
+        console.error('❌ БОТ УЖЕ ЗАПУЩЕН В ДРУГОМ МЕСТЕ!');
+    }
 });
 
-// Веб-статус
-app.get('/', (req, res) => {
-    res.send(`
-        <h1>Main Bot Status</h1>
-        <p>✅ Основной бот работает</p>
-        <p>🤖 Bot Token: ${BOT_TOKEN ? 'установлен' : 'НЕ УСТАНОВЛЕН'}</p>
-        <p>🇷🇺 Russian Group: ${RUSSIAN_GROUP_URL ? 'установлен' : 'НЕ УСТАНОВЛЕН'}</p>
-        <p>🇬🇧 English Group: ${ENGLISH_GROUP_URL ? 'установлен' : 'НЕ УСТАНОВЛЕН'}</p>
-        <p>🌐 Webhook: ${WEBHOOK_URL ? 'установлен' : 'polling режим'}</p>
-        
-        <h2>Функционал:</h2>
-        <ul>
-            <li>Команда /start показывает 2 кнопки</li>
-            <li>Кнопки ведут в группы по ссылкам</li>
-            <li>Никаких других команд нет</li>
-        </ul>
-    `);
+// Простейший HTTP сервер для Render
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+    if (req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`
+            <h1>Простой Telegram Бот</h1>
+            <p>✅ Бот работает</p>
+            <p>🤖 Токен: ${BOT_TOKEN ? 'установлен' : 'НЕ УСТАНОВЛЕН'}</p>
+            <p>🇷🇺 Русская группа: ${RUSSIAN_GROUP_URL}</p>
+            <p>🇬🇧 Английская группа: ${ENGLISH_GROUP_URL}</p>
+            <p>📝 Функция: При /start показывает 2 кнопки</p>
+            <p>🚀 Статус: ${BOT_TOKEN ? 'Готов к работе' : 'Ошибка токена'}</p>
+        `);
+    } else {
+        res.writeHead(404);
+        res.end('Not Found');
+    }
 });
 
-// Запуск
-app.listen(PORT, () => {
-    console.log(`🚀 Основной бот запущен на порту ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`🚀 HTTP сервер запущен на порту ${PORT}`);
+    console.log(`🌐 Откройте: http://localhost:${PORT}`);
+    console.log('=== БОТ ГОТОВ ===');
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n💤 Остановка бота...');
+    bot.stopPolling();
+    server.close(() => {
+        console.log('✅ Бот остановлен');
+        process.exit(0);
+    });
 });
