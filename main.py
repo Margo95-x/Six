@@ -60,6 +60,58 @@ async def get_db_connection():
 
 class DatabaseService:
     @staticmethod
+    async def set_user_limit(user_id: int, limit: int) -> bool:
+        async with get_db_connection() as conn:
+            await conn.execute(
+                "UPDATE users SET post_limit = $2 WHERE user_id = $1",
+                user_id, limit
+            )
+            # Обновляем кеш
+            if user_id in user_cache:
+                user_cache[user_id]['post_limit'] = limit
+            return True
+
+    @staticmethod
+    async def ban_user(user_id: int, reason: str = None) -> bool:
+        async with get_db_connection() as conn:
+            await conn.execute(
+                "UPDATE users SET is_banned = TRUE, ban_reason = $2 WHERE user_id = $1",
+                user_id, reason
+            )
+            # Обновляем кеш
+            if user_id in user_cache:
+                user_cache[user_id]['is_banned'] = True
+                user_cache[user_id]['ban_reason'] = reason
+            return True
+
+    @staticmethod
+    async def unban_user(user_id: int) -> bool:
+        async with get_db_connection() as conn:
+            await conn.execute(
+                "UPDATE users SET is_banned = FALSE, ban_reason = NULL WHERE user_id = $1",
+                user_id
+            )
+            # Обновляем кеш
+            if user_id in user_cache:
+                user_cache[user_id]['is_banned'] = False
+                user_cache[user_id]['ban_reason'] = None
+            return True
+
+    @staticmethod
+    async def get_user_info(user_id: int) -> Optional[Dict]:
+        # Проверяем кеш
+        if user_id in user_cache:
+            return user_cache[user_id]
+        
+        async with get_db_connection() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            if user:
+                user_dict = dict(user)
+                user_cache[user_id] = user_dict
+                return user_dict
+            return None
+
+    @staticmethod
     async def init_database():
         global db_pool
         if not config.DATABASE_URL:
@@ -77,15 +129,20 @@ class DatabaseService:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS posts (
                     id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
+                    telegram_id BIGINT NOT NULL,
                     description TEXT NOT NULL,
                     category TEXT NOT NULL,
                     tags JSONB NOT NULL DEFAULT '[]',
                     likes INTEGER DEFAULT 0,
+                    reports_count INTEGER DEFAULT 0,
                     status TEXT DEFAULT 'pending',
                     moderation_message_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    creator JSONB NOT NULL
+                    creator_telegram_id BIGINT NOT NULL,
+                    creator_username TEXT,
+                    creator_first_name TEXT,
+                    creator_last_name TEXT,
+                    creator_photo_url TEXT
                 )
             """)
             
@@ -93,23 +150,19 @@ class DatabaseService:
                 CREATE TABLE IF NOT EXISTS post_reports (
                     id SERIAL PRIMARY KEY,
                     post_id INTEGER REFERENCES posts(id),
-                    reporter_id BIGINT NOT NULL,
+                    reporter_telegram_id BIGINT NOT NULL,
                     reason TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    photo_url TEXT,
-                    favorites BIGINT[] DEFAULT '{}',
-                    hidden BIGINT[] DEFAULT '{}',
-                    liked BIGINT[] DEFAULT '{}',
-                    posts BIGINT[] DEFAULT '{}',
+                CREATE TABLE IF NOT EXISTS accounts (
+                    telegram_id BIGINT PRIMARY KEY,
+                    liked_posts BIGINT[] DEFAULT '{}',
+                    favorite_posts BIGINT[] DEFAULT '{}',
+                    hidden_posts BIGINT[] DEFAULT '{}',
+                    own_posts BIGINT[] DEFAULT '{}',
                     is_banned BOOLEAN DEFAULT FALSE,
                     ban_reason TEXT,
                     post_limit INTEGER DEFAULT 60,
@@ -120,59 +173,72 @@ class DatabaseService:
             """)
             
             # Индексы
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_telegram_id ON posts(telegram_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_creator_telegram_id ON posts(creator_telegram_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_telegram_id ON accounts(telegram_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_post_reports_post_id ON post_reports(post_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_post_reports_reporter ON post_reports(reporter_telegram_id)")
         
         logger.info("Database initialized")
 
     @staticmethod
-    async def sync_user(user_data: Dict) -> Dict:
+    async def sync_user(telegram_id: int) -> Dict:
         async with get_db_connection() as conn:
             # Сброс счетчика постов если нужно
             await conn.execute("""
-                UPDATE users 
+                UPDATE accounts 
                 SET posts_today = 0, last_post_count_reset = CURRENT_DATE
-                WHERE user_id = $1 AND last_post_count_reset < CURRENT_DATE
-            """, user_data['user_id'])
+                WHERE telegram_id = $1 AND last_post_count_reset < CURRENT_DATE
+            """, telegram_id)
             
-            user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_data['user_id'])
+            account = await conn.fetchrow("SELECT * FROM accounts WHERE telegram_id = $1", telegram_id)
             
-            if not user:
+            if not account:
                 await conn.execute("""
-                    INSERT INTO users (user_id, username, first_name, last_name, photo_url)
-                    VALUES ($1, $2, $3, $4, $5)
-                """, user_data['user_id'], user_data['username'], user_data['first_name'],
-                    user_data['last_name'], user_data['photo_url'])
-                user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_data['user_id'])
-            else:
-                # Обновляем информацию
-                await conn.execute("""
-                    UPDATE users SET username = $2, first_name = $3, last_name = $4, photo_url = $5
-                    WHERE user_id = $1
-                """, user_data['user_id'], user_data['username'], user_data['first_name'],
-                    user_data['last_name'], user_data['photo_url'])
+                    INSERT INTO accounts (telegram_id) VALUES ($1)
+                """, telegram_id)
+                account = await conn.fetchrow("SELECT * FROM accounts WHERE telegram_id = $1", telegram_id)
             
-            # Кешируем пользователя
-            user_dict = dict(user)
-            user_cache[user_data['user_id']] = user_dict
-            return user_dict
+            # Кешируем аккаунт
+            account_dict = dict(account)
+            user_cache[telegram_id] = account_dict
+            
+            # Возвращаем только метаданные
+            return {
+                'user_id': telegram_id,
+                'limits': {
+                    'used': account_dict.get('posts_today', 0),
+                    'total': account_dict.get('post_limit', config.DAILY_POST_LIMIT)
+                },
+                'is_banned': account_dict.get('is_banned', False),
+                'ban_reason': account_dict.get('ban_reason')
+            }
 
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
         async with get_db_connection() as conn:
+            creator = post_data['creator_data']
             post_id = await conn.fetchval("""
-                INSERT INTO posts (user_id, description, category, tags, creator, status)
-                VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id
-            """, post_data['user_id'], post_data['description'], post_data['category'],
-                json.dumps(post_data['tags']), json.dumps(post_data['creator']))
+                INSERT INTO posts (
+                    telegram_id, description, category, tags, status,
+                    creator_telegram_id, creator_username, creator_first_name, 
+                    creator_last_name, creator_photo_url
+                )
+                VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9) 
+                RETURNING id
+            """, post_data['telegram_id'], post_data['description'], post_data['category'],
+                json.dumps(post_data['tags']), creator['telegram_id'], creator['username'],
+                creator['first_name'], creator['last_name'], creator['photo_url'])
             
             # Увеличиваем счетчик постов пользователя
             await conn.execute("""
-                UPDATE users SET posts_today = posts_today + 1 WHERE user_id = $1
-            """, post_data['user_id'])
+                UPDATE accounts SET posts_today = posts_today + 1, 
+                own_posts = array_append(own_posts, $2)
+                WHERE telegram_id = $1
+            """, post_data['telegram_id'], post_id)
             
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             post_dict = dict(post)
@@ -195,7 +261,7 @@ class DatabaseService:
             # Поиск
             if search:
                 param_count += 1
-                query += f" AND LOWER(description) LIKE LOWER($${param_count})"
+                query += f" AND LOWER(description) LIKE LOWER(${param_count})"
                 params.append(f"%{search}%")
             
             # Фильтры по тегам
@@ -204,7 +270,7 @@ class DatabaseService:
                     if values and filter_type != 'sort' and isinstance(values, list):
                         for value in values:
                             param_count += 1
-                            query += f" AND tags @> $${param_count}"
+                            query += f" AND tags @> ${param_count}"
                             params.append(json.dumps([f"{filter_type}:{value}"]))
             
             # Сортировка
@@ -250,10 +316,10 @@ class DatabaseService:
             return None
 
     @staticmethod
-    async def delete_post(post_id: int, user_id: int = None) -> bool:
+    async def delete_post(post_id: int, telegram_id: int = None) -> bool:
         async with get_db_connection() as conn:
-            if user_id:
-                result = await conn.execute("DELETE FROM posts WHERE id = $1 AND user_id = $2", post_id, user_id)
+            if telegram_id:
+                result = await conn.execute("DELETE FROM posts WHERE id = $1 AND telegram_id = $2", post_id, telegram_id)
             else:
                 result = await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
             
@@ -273,11 +339,16 @@ class DatabaseService:
             return None
 
     @staticmethod
-    async def report_post(post_id: int, reporter_id: int, reason: str = None) -> bool:
+    async def report_post(post_id: int, reporter_telegram_id: int, reason: str = None) -> bool:
         async with get_db_connection() as conn:
             await conn.execute("""
-                INSERT INTO post_reports (post_id, reporter_id, reason) VALUES ($1, $2, $3)
-            """, post_id, reporter_id, reason)
+                INSERT INTO post_reports (post_id, reporter_telegram_id, reason) VALUES ($1, $2, $3)
+            """, post_id, reporter_telegram_id, reason)
+            
+            # Увеличиваем счетчик жалоб
+            await conn.execute("""
+                UPDATE posts SET reports_count = reports_count + 1 WHERE id = $1
+            """, post_id)
             return True
 
     @staticmethod
@@ -327,9 +398,9 @@ class DatabaseService:
 # Система лимитов (в памяти)
 class PostLimitService:
     @staticmethod
-    async def check_user_limit(user_id: int) -> bool:
-        posts_today = await DatabaseService.get_user_posts_today(user_id)
-        limit = await DatabaseService.get_user_limit(user_id)
+    async def check_user_limit(telegram_id: int) -> bool:
+        posts_today = await DatabaseService.get_user_posts_today(telegram_id)
+        limit = await DatabaseService.get_user_limit(telegram_id)
         return posts_today < limit
 
 # Telegram Bot
@@ -346,6 +417,11 @@ class ModerationBot:
         # Команды
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("delete", self.delete_command))
+        self.app.add_handler(CommandHandler("ban", self.ban_command))
+        self.app.add_handler(CommandHandler("unban", self.unban_command))
+        self.app.add_handler(CommandHandler("setlimit", self.setlimit_command))
+        self.app.add_handler(CommandHandler("getlimit", self.getlimit_command))
+        self.app.add_handler(CommandHandler("userinfo", self.userinfo_command))
         self.app.add_handler(CallbackQueryHandler(self.handle_moderation_callback))
         
         await self.app.initialize()
@@ -359,9 +435,167 @@ class ModerationBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🤖 Бот модерации объявлений\n\n"
-            "Команды:\n"
-            "/delete <post_id> - Удалить объявление"
+            "Команды модерации:\n"
+            "/delete <post_id> - Удалить объявление\n\n"
+            "Команды администрирования:\n"
+            "/ban <user_id> [причина] - Забанить пользователя\n"
+            "/unban <user_id> - Снять бан\n"
+            "/setlimit <user_id> <лимит> - Установить лимит постов\n"
+            "/getlimit <user_id> - Проверить лимит\n"
+            "/userinfo <user_id> - Информация о пользователе"
         )
+
+    async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Использование: /ban <telegram_id> [причина]")
+            return
+        
+        try:
+            telegram_id = int(context.args[0])
+            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Нарушение правил"
+            
+            await DatabaseService.ban_user(telegram_id, reason)
+            
+            # Уведомить пользователя
+            try:
+                await telegram_bot.send_message(
+                    chat_id=telegram_id,
+                    text=f"🚫 Ваш аккаунт заблокирован.\nПричина: {reason}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify banned user {telegram_id}: {e}")
+            
+            await update.message.reply_text(f"✅ Пользователь {telegram_id} заблокирован")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверный Telegram ID")
+        except Exception as e:
+            logger.error(f"Ban command error: {e}")
+            await update.message.reply_text("❌ Произошла ошибка")
+
+    async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Использование: /unban <telegram_id>")
+            return
+        
+        try:
+            telegram_id = int(context.args[0])
+            
+            await DatabaseService.unban_user(telegram_id)
+            
+            # Уведомить пользователя
+            try:
+                await telegram_bot.send_message(
+                    chat_id=telegram_id,
+                    text="✅ Ваш аккаунт разблокирован"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify unbanned user {telegram_id}: {e}")
+            
+            await update.message.reply_text(f"✅ Пользователь {telegram_id} разблокирован")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверный Telegram ID")
+        except Exception as e:
+            logger.error(f"Unban command error: {e}")
+            await update.message.reply_text("❌ Произошла ошибка")
+
+    async def setlimit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if len(context.args) != 2:
+            await update.message.reply_text("Использование: /setlimit <telegram_id> <лимит>")
+            return
+        
+        try:
+            telegram_id = int(context.args[0])
+            limit = int(context.args[1])
+            
+            if limit < 0:
+                await update.message.reply_text("❌ Лимит не может быть отрицательным")
+                return
+            
+            await DatabaseService.set_user_limit(telegram_id, limit)
+            
+            # Уведомить пользователя
+            try:
+                await telegram_bot.send_message(
+                    chat_id=telegram_id,
+                    text=f"📊 Ваш лимит объявлений изменен на {limit} в день"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify user {telegram_id}: {e}")
+            
+            await update.message.reply_text(f"✅ Лимит для пользователя {telegram_id} установлен: {limit}")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверные параметры")
+        except Exception as e:
+            logger.error(f"Setlimit command error: {e}")
+            await update.message.reply_text("❌ Произошла ошибка")
+
+    async def getlimit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Использование: /getlimit <telegram_id>")
+            return
+        
+        try:
+            telegram_id = int(context.args[0])
+            account_info = await DatabaseService.get_account_info(telegram_id)
+            
+            if account_info:
+                text = (
+                    f"📊 Информация о лимитах для {telegram_id}:\n"
+                    f"Лимит в день: {account_info.get('post_limit', config.DAILY_POST_LIMIT)}\n"
+                    f"Постов сегодня: {account_info.get('posts_today', 0)}\n"
+                    f"Заблокирован: {'Да' if account_info.get('is_banned') else 'Нет'}"
+                )
+                if account_info.get('ban_reason'):
+                    text += f"\nПричина бана: {account_info['ban_reason']}"
+            else:
+                text = f"❌ Пользователь {telegram_id} не найден"
+            
+            await update.message.reply_text(text)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверный Telegram ID")
+        except Exception as e:
+            logger.error(f"Getlimit command error: {e}")
+            await update.message.reply_text("❌ Произошла ошибка")
+
+    async def userinfo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Использование: /userinfo <telegram_id>")
+            return
+        
+        try:
+            telegram_id = int(context.args[0])
+            account_info = await DatabaseService.get_account_info(telegram_id)
+            
+            if not account_info:
+                await update.message.reply_text("❌ Пользователь не найден")
+                return
+            
+            text = (
+                f"👤 Информация об аккаунте {telegram_id}:\n"
+                f"Лимит постов: {account_info.get('post_limit', config.DAILY_POST_LIMIT)}\n"
+                f"Постов сегодня: {account_info.get('posts_today', 0)}\n"
+                f"Собственных постов: {len(account_info.get('own_posts', []))}\n"
+                f"Избранных: {len(account_info.get('favorite_posts', []))}\n"
+                f"Скрытых: {len(account_info.get('hidden_posts', []))}\n"
+                f"Лайков: {len(account_info.get('liked_posts', []))}\n"
+                f"Заблокирован: {'Да' if account_info.get('is_banned') else 'Нет'}\n"
+                f"Зарегистрирован: {account_info['created_at'].strftime('%Y-%m-%d %H:%M')}"
+            )
+            
+            if account_info.get('ban_reason'):
+                text += f"\nПричина бана: {account_info['ban_reason']}"
+            
+            await update.message.reply_text(text)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверный Telegram ID")
+        except Exception as e:
+            logger.error(f"Userinfo command error: {e}")
+            await update.message.reply_text("❌ Произошла ошибка")
 
     async def delete_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
@@ -446,13 +680,11 @@ class ModerationBot:
             return await DatabaseService.approve_post(post['id'])
         
         try:
-            creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
-            
             text = (
                 f"📝 Новое объявление #{post['id']}\n\n"
-                f"👤 От: {creator['first_name']} {creator.get('last_name', '')}\n"
-                f"🆔 ID: {creator['user_id']}\n"
-                f"👤 Username: @{creator.get('username', 'нет')}\n"
+                f"👤 От: {post['creator_first_name']} {post.get('creator_last_name', '')}\n"
+                f"🆔 ID: {post['creator_telegram_id']}\n"
+                f"👤 Username: @{post.get('creator_username', 'нет')}\n"
                 f"📂 Категория: {post['category']}\n\n"
                 f"📄 Текст:\n{post['description']}\n\n"
                 f"🏷 Теги: {', '.join(json.loads(post['tags']) if post['tags'] else [])}"
@@ -514,10 +746,10 @@ async def handle_websocket(websocket: WebSocketServerProtocol):
 
 async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dict):
     action = data.get('type')
-    user_id = data.get('user_id')
+    telegram_id = data.get('user_id')
     
     # Проверяем бан
-    if user_id and await DatabaseService.is_user_banned(user_id):
+    if telegram_id and await DatabaseService.is_user_banned(telegram_id):
         await websocket.send(json.dumps({
             'type': 'banned',
             'message': 'Ваш аккаунт заблокирован'
@@ -525,19 +757,18 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         return
     
     if action == 'sync_user':
-        user_data = await DatabaseService.sync_user(data)
+        user_data = await DatabaseService.sync_user(telegram_id)
         await websocket.send(json.dumps({
-            'type': 'user_data',
+            'type': 'user_synced',
             'user_id': user_data['user_id'],
-            'first_name': user_data['first_name'],
-            'last_name': user_data['last_name'],
-            'username': user_data['username'],
-            'photo_url': user_data['photo_url']
+            'limits': user_data['limits'],
+            'is_banned': user_data['is_banned'],
+            'ban_reason': user_data.get('ban_reason')
         }))
     
     elif action == 'create_post':
         # Проверка лимита
-        if not await PostLimitService.check_user_limit(user_id):
+        if not await PostLimitService.check_user_limit(telegram_id):
             await websocket.send(json.dumps({
                 'type': 'limit_exceeded',
                 'message': f'Достигнут дневной лимит объявлений'
@@ -546,12 +777,19 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         
         # Создание поста
         post = await DatabaseService.create_post({
-            'user_id': user_id,
+            'telegram_id': telegram_id,
             'description': data['description'],
             'category': data['category'],
             'tags': data['tags'],
-            'creator': data['creator']
+            'creator_data': data['creator_data']
         })
+        
+        # Получаем обновленные лимиты
+        account_info = await DatabaseService.get_account_info(telegram_id)
+        limits = {
+            'used': account_info.get('posts_today', 0) if account_info else 0,
+            'total': account_info.get('post_limit', config.DAILY_POST_LIMIT) if account_info else config.DAILY_POST_LIMIT
+        }
         
         # Отправляем на модерацию
         if telegram_bot:
@@ -560,7 +798,8 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         
         await websocket.send(json.dumps({
             'type': 'post_created',
-            'message': 'Объявление отправлено на модерацию'
+            'message': 'Объявление отправлено на модерацию',
+            'limits': limits
         }))
     
     elif action == 'get_posts':
@@ -579,14 +818,14 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             await broadcast_message({'type': 'post_updated', 'post': post})
     
     elif action == 'delete_post':
-        success = await DatabaseService.delete_post(data['post_id'], data['user_id'])
+        success = await DatabaseService.delete_post(data['post_id'], telegram_id)
         if success:
             await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
     
     elif action == 'report_post':
         await DatabaseService.report_post(
             data['post_id'], 
-            data['user_id'], 
+            telegram_id, 
             data.get('reason')
         )
 
