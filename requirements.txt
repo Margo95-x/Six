@@ -3,7 +3,7 @@ asyncpg==0.29.0
 websockets==12.0
 python-telegram-bot==21.3
 aiohttp==3.9.5
-dataclasses==0.8
+dataclasses==0.6
 
 # Для работы с данными  
 psycopg2-binary==2.9.9
