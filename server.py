@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 server.py - Telegram Web App Server для Render
-Backend сервер с поддержкой CORS для GitHub Pages фронтенда
+Backend сервер с HTTP + WebSocket на одном порту
 """
 
 import asyncio
@@ -11,13 +11,11 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import asyncpg
-import websockets
-from websockets.server import WebSocketServerProtocol
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from aiohttp import web
+from aiohttp import web, WSMsgType
 import aiohttp_cors
 from dataclasses import dataclass
 
@@ -214,50 +212,28 @@ class ModerationBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤖 Telegram Web App Server is running!")
 
-# WebSocket
+# WebSocket обработка
 async def broadcast_message(message: Dict):
     global connected_clients
     if connected_clients:
         message_str = json.dumps(message, default=str)
         disconnected_clients = set()
         
-        for client in connected_clients.copy():
+        for ws in connected_clients.copy():
             try:
-                await client.send(message_str)
-            except websockets.exceptions.ConnectionClosed:
-                disconnected_clients.add(client)
+                await ws.send_str(message_str)
             except Exception as e:
                 logger.error(f"Error broadcasting to client: {e}")
-                disconnected_clients.add(client)
+                disconnected_clients.add(ws)
         
         connected_clients -= disconnected_clients
 
-async def handle_websocket(websocket: WebSocketServerProtocol):
-    connected_clients.add(websocket)
-    logger.info(f"Client connected. Total clients: {len(connected_clients)}")
-    
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-                await handle_websocket_message(websocket, data)
-            except json.JSONDecodeError:
-                await websocket.send(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
-            except Exception as e:
-                logger.error(f"WebSocket message error: {e}")
-                await websocket.send(json.dumps({'type': 'error', 'message': str(e)}))
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    finally:
-        connected_clients.discard(websocket)
-        logger.info(f"Client disconnected. Total clients: {len(connected_clients)}")
-
-async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dict):
+async def handle_websocket_message(ws, data: Dict):
     action = data.get('type')
     telegram_id = data.get('telegram_id')
     
     if not telegram_id:
-        await websocket.send(json.dumps({
+        await ws.send_str(json.dumps({
             'type': 'error',
             'message': 'telegram_id is required'
         }, default=str))
@@ -275,7 +251,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             }
             
             user_data_result = await DatabaseService.sync_user(user_data)
-            await websocket.send(json.dumps({
+            await ws.send_str(json.dumps({
                 'type': 'user_synced',
                 'telegram_id': user_data_result['telegram_id'],
                 'limits': {
@@ -287,25 +263,25 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             }, default=str))
             
         elif action == 'ping':
-            await websocket.send(json.dumps({
+            await ws.send_str(json.dumps({
                 'type': 'pong',
                 'timestamp': datetime.now().isoformat()
             }, default=str))
             
         else:
-            await websocket.send(json.dumps({
+            await ws.send_str(json.dumps({
                 'type': 'error',
                 'message': f'Unknown action: {action}'
             }, default=str))
             
     except Exception as e:
         logger.error(f"Error handling websocket message: {e}")
-        await websocket.send(json.dumps({
+        await ws.send_str(json.dumps({
             'type': 'error',
             'message': 'Internal server error'
         }, default=str))
 
-# HTTP Server с CORS
+# HTTP + WebSocket Server
 async def create_app():
     app = web.Application()
     
@@ -319,6 +295,36 @@ async def create_app():
         )
     })
     
+    # WebSocket endpoint
+    async def websocket_handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        connected_clients.add(ws)
+        logger.info(f"WebSocket client connected. Total: {len(connected_clients)}")
+        
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        await handle_websocket_message(ws, data)
+                    except json.JSONDecodeError:
+                        await ws.send_str(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
+                    except Exception as e:
+                        logger.error(f"WebSocket message error: {e}")
+                        await ws.send_str(json.dumps({'type': 'error', 'message': str(e)}))
+                elif msg.type == WSMsgType.ERROR:
+                    logger.error(f'WebSocket error: {ws.exception()}')
+        except Exception as e:
+            logger.error(f"WebSocket handler error: {e}")
+        finally:
+            connected_clients.discard(ws)
+            logger.info(f"WebSocket client disconnected. Total: {len(connected_clients)}")
+        
+        return ws
+    
+    # HTTP endpoints
     async def health_handler(request):
         return web.json_response({
             'status': 'ok',
@@ -330,11 +336,17 @@ async def create_app():
         return web.json_response({
             'app': 'Telegram Web App Server',
             'version': '2.0',
-            'websocket_port': config.PORT,
-            'clients_connected': len(connected_clients)
+            'port': config.PORT,
+            'clients_connected': len(connected_clients),
+            'endpoints': {
+                'websocket': '/ws',
+                'health': '/health',
+                'info': '/info'
+            }
         })
     
     # Добавляем маршруты
+    app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/health', health_handler)
     app.router.add_get('/info', info_handler)
     app.router.add_get('/', info_handler)
@@ -354,25 +366,17 @@ async def main():
     moderation_bot = ModerationBot()
     await moderation_bot.init_bot()
     
-    # Создание HTTP приложения
+    # Создание HTTP + WebSocket приложения
     app = await create_app()
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Запуск HTTP сервера
+    # Запуск сервера на одном порту
     site = web.TCPSite(runner, '0.0.0.0', config.PORT)
     await site.start()
-    logger.info(f"HTTP server started on port {config.PORT}")
-    
-    # Запуск WebSocket сервера на том же порту
-    ws_server = await websockets.serve(
-        handle_websocket, 
-        '0.0.0.0', 
-        config.PORT,
-        # Добавляем поддержку HTTP и WebSocket на одном порту
-        process_request=None
-    )
-    logger.info(f"WebSocket server started on port {config.PORT}")
+    logger.info(f"Server started on port {config.PORT}")
+    logger.info(f"WebSocket endpoint: /ws")
+    logger.info(f"Health check: /health")
     
     # Запуск бота с обработкой ошибок
     if moderation_bot.app:
@@ -394,7 +398,6 @@ async def main():
                 await moderation_bot.app.stop()
         except:
             pass
-        ws_server.close()
         await runner.cleanup()
 
 if __name__ == '__main__':
