@@ -3,7 +3,6 @@
 main.py - Entry point for Render deployment
 Точка входа для деплоя backend на Render
 """
-
 import sys
 import os
 import logging
@@ -16,7 +15,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
 logger = logging.getLogger(__name__)
 
 def main():
@@ -50,5 +48,5 @@ def main():
         logger.error(f"Application error: {e}")
         raise
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # ✅ ИСПРАВЛЕНО: двойные подчеркивания
     main()
