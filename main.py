@@ -683,8 +683,9 @@ class ModerationBot:
 
 # WebSocket
 async def broadcast_message(message: Dict, filter_data: Dict = None):
+    global connected_clients
     if connected_clients:
-        message_str = json.dumps(message)
+        message_str = json.dumps(message, default=str)  # default=str для datetime
         disconnected_clients = set()
         
         for client in connected_clients.copy():
@@ -730,7 +731,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         await websocket.send(json.dumps({
             'type': 'error',
             'message': 'telegram_id is required'
-        }))
+        }, default=str))
         return
     
     # Проверяем бан
@@ -738,7 +739,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         await websocket.send(json.dumps({
             'type': 'banned',
             'message': 'Ваш аккаунт заблокирован'
-        }))
+        }, default=str))
         return
     
     if action == 'sync_user':
@@ -761,7 +762,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                 'total': user_data_result.get('post_limit', config.DAILY_POST_LIMIT)
             },
             'is_banned': user_data_result.get('is_banned', False)
-        }))
+        }, default=str))
     
     elif action == 'create_post':
         # Проверка лимита
@@ -769,7 +770,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             await websocket.send(json.dumps({
                 'type': 'limit_exceeded',
                 'message': f'Достигнут дневной лимит объявлений'
-            }))
+            }, default=str))
             return
         
         # Создание поста
@@ -797,7 +798,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                 'used': published_count,
                 'total': limit
             }
-        }))
+        }, default=str))
     
     elif action == 'get_posts':
         posts = await DatabaseService.get_posts(
@@ -807,13 +808,13 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             'type': 'posts',
             'posts': posts,
             'append': data.get('append', False)
-        }))
+        }, default=str))
     
     elif action == 'like_post':
         post = await DatabaseService.like_post(data['post_id'], telegram_id)
         if post:
             # Отправляем только этому пользователю обновление
-            await websocket.send(json.dumps({'type': 'post_updated', 'post': post}))
+            await websocket.send(json.dumps({'type': 'post_updated', 'post': post}, default=str))
     
     elif action == 'delete_post':
         success = await DatabaseService.delete_post(data['post_id'], telegram_id)
@@ -829,7 +830,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                     'used': published_count,
                     'total': limit
                 }
-            }))
+            }, default=str))
     
     elif action == 'report_post':
         post = await DatabaseService.get_post_by_id(data['post_id'])
@@ -845,7 +846,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                     await websocket.send(json.dumps({
                         'type': 'error',
                         'message': 'Вы уже отправляли жалобу на это объявление'
-                    }))
+                    }, default=str))
                 else:
                     # Отправляем жалобу модераторам
                     if telegram_bot:
@@ -861,7 +862,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                     await websocket.send(json.dumps({
                         'type': 'report_sent',
                         'message': 'Жалоба отправлена модераторам'
-                    }))
+                    }, default=str))
     
     elif action == 'add_to_favorites':
         result = await DatabaseService.add_to_favorites(data['post_id'], telegram_id)
@@ -869,7 +870,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             'type': 'favorites_updated',
             'action': result['action'],
             'message': result['message']
-        }))
+        }, default=str))
     
     elif action == 'hide_post':
         result = await DatabaseService.hide_post(data['post_id'], telegram_id)
@@ -877,7 +878,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             'type': 'hide_updated',
             'action': result['action'],
             'message': result['message']
-        }))
+        }, default=str))
 
 # Основная функция для запуска HTTP сервера статических файлов
 async def serve_static_files():
