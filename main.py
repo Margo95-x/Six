@@ -120,12 +120,47 @@ class DatabaseService:
                 )
             """)
             
-            # Индексы
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+            # Миграции для существующих таблиц
+            try:
+                # Добавляем новые колонки в users если их нет
+                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS liked BIGINT[] DEFAULT '{}'")
+                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reported_posts BIGINT[] DEFAULT '{}'")
+                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS post_limit INTEGER DEFAULT 60")
+                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_post_count_reset DATE DEFAULT CURRENT_DATE")
+                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS posts_today INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"Migration warning: {e}")
+            
+            # Проверяем, существует ли колонка user_id в posts перед созданием индексов
+            try:
+                posts_columns = await conn.fetch("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'posts' AND table_schema = 'public'
+                """)
+                column_names = [row['column_name'] for row in posts_columns]
+                
+                # Создаем индексы только если колонки существуют
+                if 'user_id' in column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)")
+                if 'category' in column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category)")
+                if 'status' in column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
+                if 'created_at' in column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)")
+                
+                # Проверяем колонки users
+                users_columns = await conn.fetch("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'users' AND table_schema = 'public'
+                """)
+                users_column_names = [row['column_name'] for row in users_columns]
+                
+                if 'user_id' in users_column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+                    
+            except Exception as e:
+                logger.error(f"Error creating indexes: {e}")
         
         logger.info("Database initialized")
 
