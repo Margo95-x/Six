@@ -10,8 +10,8 @@ import asyncio
 import logging
 import os
 import json
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 import asyncpg
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -48,6 +48,12 @@ post_limits = defaultdict(list)  # Кеш лимитов в памяти
 posts_cache = {}  # Кеш постов в памяти
 user_cache = {}   # Кеш пользователей в памяти
 
+def json_serializer(obj):
+    """JSON serializer function that handles datetime objects"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
 # База данных
 @asynccontextmanager
 async def get_db_connection():
@@ -76,7 +82,6 @@ class DatabaseService:
             # Удаляем старые таблицы если существуют (для обновления структуры)
             await conn.execute("DROP TABLE IF EXISTS post_reports CASCADE")
             await conn.execute("DROP TABLE IF EXISTS posts CASCADE") 
-            await conn.execute("DROP TABLE IF EXISTS users CASCADE")
             await conn.execute("DROP TABLE IF EXISTS accounts CASCADE")
             
             # Создаем таблицы с новой структурой
@@ -92,6 +97,7 @@ class DatabaseService:
                     status TEXT DEFAULT 'pending',
                     moderation_message_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    moderated_at TIMESTAMP,
                     creator_telegram_id BIGINT NOT NULL,
                     creator_username TEXT,
                     creator_first_name TEXT,
@@ -127,14 +133,14 @@ class DatabaseService:
             """)
             
             # Создаем индексы
-            await conn.execute("CREATE INDEX idx_posts_telegram_id ON posts(telegram_id)")
-            await conn.execute("CREATE INDEX idx_posts_category ON posts(category)")
-            await conn.execute("CREATE INDEX idx_posts_status ON posts(status)")
-            await conn.execute("CREATE INDEX idx_posts_created_at ON posts(created_at DESC)")
-            await conn.execute("CREATE INDEX idx_posts_creator_telegram_id ON posts(creator_telegram_id)")
-            await conn.execute("CREATE INDEX idx_accounts_telegram_id ON accounts(telegram_id)")
-            await conn.execute("CREATE INDEX idx_post_reports_post_id ON post_reports(post_id)")
-            await conn.execute("CREATE INDEX idx_post_reports_reporter ON post_reports(reporter_telegram_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_telegram_id ON posts(telegram_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_creator_telegram_id ON posts(creator_telegram_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_telegram_id ON accounts(telegram_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_post_reports_post_id ON post_reports(post_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_post_reports_reporter ON post_reports(reporter_telegram_id)")
         
         logger.info("Database initialized with new structure")
 
@@ -215,7 +221,7 @@ class DatabaseService:
             # Поиск
             if search:
                 param_count += 1
-                query += f" AND LOWER(description) LIKE LOWER($${param_count})"
+                query += f" AND LOWER(description) LIKE LOWER(${param_count})"
                 params.append(f"%{search}%")
             
             # Фильтры по тегам
@@ -224,7 +230,7 @@ class DatabaseService:
                     if values and filter_type != 'sort' and isinstance(values, list):
                         for value in values:
                             param_count += 1
-                            query += f" AND tags @> $${param_count}"
+                            query += f" AND tags @> ${param_count}"
                             params.append(json.dumps([f"{filter_type}:{value}"]))
             
             # Сортировка
@@ -250,7 +256,10 @@ class DatabaseService:
     @staticmethod
     async def approve_post(post_id: int) -> Optional[Dict]:
         async with get_db_connection() as conn:
-            await conn.execute("UPDATE posts SET status = 'approved' WHERE id = $1", post_id)
+            await conn.execute(
+                "UPDATE posts SET status = 'approved', moderated_at = CURRENT_TIMESTAMP WHERE id = $1", 
+                post_id
+            )
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             if post:
                 post_dict = dict(post)
@@ -261,7 +270,10 @@ class DatabaseService:
     @staticmethod
     async def reject_post(post_id: int) -> Optional[Dict]:
         async with get_db_connection() as conn:
-            await conn.execute("UPDATE posts SET status = 'rejected' WHERE id = $1", post_id)
+            await conn.execute(
+                "UPDATE posts SET status = 'rejected', moderated_at = CURRENT_TIMESTAMP WHERE id = $1", 
+                post_id
+            )
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             if post:
                 # Удаляем из кеша
@@ -642,41 +654,60 @@ class ModerationBot:
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def handle_moderation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка callbacks от кнопок модерации"""
         query = update.callback_query
         await query.answer()
         
-        data = query.data.split("_")
-        action = data[0]
-        post_id = int(data[1])
-        
-        post = await DatabaseService.get_post_by_id(post_id)
-        if not post:
-            await query.edit_message_text("❌ Объявление не найдено")
-            return
-        
-        if action == "approve":
-            approved_post = await DatabaseService.approve_post(post_id)
-            if approved_post:
-                await broadcast_message({
-                    'type': 'post_updated',
-                    'post': approved_post
-                })
-                await query.edit_message_text("✅ Объявление одобрено и опубликовано")
-            else:
-                await query.edit_message_text("❌ Ошибка при одобрении")
+        try:
+            data = query.data.split('_')
+            action = data[0]
+            post_id = int(data[1])
+            
+            if action == 'approve':
+                # Одобрить пост
+                post = await DatabaseService.approve_post(post_id)
+                if post:
+                    # Отправляем обновление всем клиентам
+                    await broadcast_message({
+                        'type': 'post_updated',
+                        'post': post
+                    })
+                    
+                    # Уведомляем создателя
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=post['creator_telegram_id'],
+                            text="✅ Ваше объявление одобрено и опубликовано!"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify creator: {e}")
                 
-        elif action == "reject":
-            await DatabaseService.reject_post(post_id)
-            
-            try:
-                await telegram_bot.send_message(
-                    chat_id=post['creator_telegram_id'],
-                    text="❌ Ваше объявление было отклонено модератором за нарушение правил"
+                await query.edit_message_text(
+                    f"✅ Пост #{post_id} одобрен",
+                    reply_markup=None
                 )
-            except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
-            
-            await query.edit_message_text("❌ Объявление отклонено")
+                
+            elif action == 'reject':
+                # Отклонить пост
+                post = await DatabaseService.reject_post(post_id)
+                if post:
+                    # Уведомляем создателя
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=post['creator_telegram_id'],
+                            text="❌ Ваше объявление отклонено модератором."
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify creator: {e}")
+                
+                await query.edit_message_text(
+                    f"❌ Пост #{post_id} отклонен",
+                    reply_markup=None
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in moderation callback: {e}")
+            await query.edit_message_text("Ошибка при обработке модерации")
 
     async def send_for_moderation(self, post: Dict):
         if not config.MODERATION_CHAT_ID:
@@ -712,23 +743,36 @@ class ModerationBot:
             return await DatabaseService.approve_post(post['id'])
 
 # WebSocket
-async def broadcast_message(message: Dict):
-    if connected_clients:
-        message_str = json.dumps(message)
-        disconnected_clients = set()
+async def broadcast_message(message: Dict[str, Any]):
+    """Отправка сообщения всем подключенным клиентам"""
+    global connected_clients
+    
+    if not connected_clients:
+        logger.info("No connected clients to broadcast to")
+        return
+    
+    try:
+        # Используем custom serializer для datetime объектов
+        message_json = json.dumps(message, default=json_serializer, ensure_ascii=False)
         
-        for client in connected_clients.copy():
+        # Создаем копию множества для безопасной итерации
+        clients_copy = connected_clients.copy()
+        
+        for client in clients_copy:
             try:
-                await client.send(message_str)
-            except websockets.exceptions.ConnectionClosed:
-                disconnected_clients.add(client)
+                await client.send(message_json)
             except Exception as e:
-                logger.error(f"Error broadcasting to client: {e}")
-                disconnected_clients.add(client)
-        
-        connected_clients -= disconnected_clients
+                logger.error(f"Error sending message to client: {e}")
+                # Удаляем отключенного клиента
+                connected_clients.discard(client)
+                
+    except Exception as e:
+        logger.error(f"Error in broadcast_message: {e}")
 
-async def handle_websocket(websocket: WebSocketServerProtocol):
+async def handle_websocket(websocket, path):
+    """Обработчик WebSocket соединений"""
+    global connected_clients
+    
     connected_clients.add(websocket)
     logger.info(f"Client connected. Total clients: {len(connected_clients)}")
     
@@ -738,16 +782,39 @@ async def handle_websocket(websocket: WebSocketServerProtocol):
                 data = json.loads(message)
                 await handle_websocket_message(websocket, data)
             except json.JSONDecodeError:
-                await websocket.send(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
+                logger.error(f"Invalid JSON received: {message}")
             except Exception as e:
                 logger.error(f"WebSocket message error: {e}")
-                await websocket.send(json.dumps({'type': 'error', 'message': str(e)}))
-    except websockets.exceptions.ConnectionClosed:
-        pass
+                
+    except Exception as e:
+        logger.error(f"WebSocket connection error: {e}")
     finally:
         connected_clients.discard(websocket)
         logger.info(f"Client disconnected. Total clients: {len(connected_clients)}")
-
+        
+              
+async def send_posts_to_client(websocket, posts_data, append=False):
+    """Отправка постов клиенту с правильной сериализацией"""
+    try:
+        # Конвертируем datetime объекты в строки
+        for post in posts_data:
+            if 'created_at' in post and isinstance(post['created_at'], datetime):
+                post['created_at'] = post['created_at'].isoformat()
+            if 'updated_at' in post and isinstance(post['updated_at'], datetime):
+                post['updated_at'] = post['updated_at'].isoformat()
+        
+        message = {
+            'type': 'posts',
+            'posts': posts_data,
+            'append': append
+        }
+        
+        await websocket.send(json.dumps(message, ensure_ascii=False))
+        
+    except Exception as e:
+        logger.error(f"Error sending posts to client: {e}")        
+        
+        
 async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dict):
     action = data.get('type')
     telegram_id = data.get('user_id')
@@ -814,7 +881,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             'type': 'posts',
             'posts': posts,
             'append': data.get('append', False)
-        }))
+        }, default=json_serializer))
     
     elif action == 'like_post':
         post = await DatabaseService.like_post(data['post_id'])
