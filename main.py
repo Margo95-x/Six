@@ -63,11 +63,25 @@ class DatabaseService:
         if not config.DATABASE_URL:
             raise ValueError("DATABASE_URL not set")
         
+        # Преобразуем postgres:// в postgresql:// для asyncpg
+        database_url = config.DATABASE_URL
+        if database_url.startswith('postgres://'):
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        
+        # SSL настройки для продакшена
+        ssl_context = None
+        if 'localhost' not in database_url and 'sslmode' not in database_url:
+            import ssl
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        
         db_pool = await asyncpg.create_pool(
-            config.DATABASE_URL,
+            database_url,
             min_size=config.DB_MIN_SIZE,
             max_size=config.DB_MAX_SIZE,
-            command_timeout=config.DB_COMMAND_TIMEOUT
+            command_timeout=config.DB_COMMAND_TIMEOUT,
+            ssl=ssl_context
         )
         
         async with get_db_connection() as conn:
