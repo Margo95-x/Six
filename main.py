@@ -77,7 +77,7 @@ class DatabaseService:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS posts (
                     id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
+                    telegram_id BIGINT NOT NULL,
                     description TEXT NOT NULL,
                     category TEXT NOT NULL,
                     tags JSONB NOT NULL DEFAULT '[]',
@@ -101,7 +101,7 @@ class DatabaseService:
             
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
+                    telegram_id BIGINT PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
                     last_name TEXT,
@@ -131,7 +131,7 @@ class DatabaseService:
             except Exception as e:
                 logger.warning(f"Migration warning: {e}")
             
-            # Проверяем, существует ли колонка user_id в posts перед созданием индексов
+            # Проверяем, существует ли колонка telegram_id в posts перед созданием индексов
             try:
                 posts_columns = await conn.fetch("""
                     SELECT column_name FROM information_schema.columns 
@@ -140,8 +140,8 @@ class DatabaseService:
                 column_names = [row['column_name'] for row in posts_columns]
                 
                 # Создаем индексы только если колонки существуют
-                if 'user_id' in column_names:
-                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)")
+                if 'telegram_id' in column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_telegram_id ON posts(telegram_id)")
                 if 'category' in column_names:
                     await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category)")
                 if 'status' in column_names:
@@ -156,8 +156,8 @@ class DatabaseService:
                 """)
                 users_column_names = [row['column_name'] for row in users_columns]
                 
-                if 'user_id' in users_column_names:
-                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+                if 'telegram_id' in users_column_names:
+                    await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)")
                     
             except Exception as e:
                 logger.error(f"Error creating indexes: {e}")
@@ -171,51 +171,51 @@ class DatabaseService:
             await conn.execute("""
                 UPDATE users 
                 SET posts_today = 0, last_post_count_reset = CURRENT_DATE
-                WHERE user_id = $1 AND last_post_count_reset < CURRENT_DATE
-            """, user_data['user_id'])
+                WHERE telegram_id = $1 AND last_post_count_reset < CURRENT_DATE
+            """, user_data['telegram_id'])
             
-            user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_data['user_id'])
+            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
             
             if not user:
                 await conn.execute("""
-                    INSERT INTO users (user_id, username, first_name, last_name, photo_url)
+                    INSERT INTO users (telegram_id, username, first_name, last_name, photo_url)
                     VALUES ($1, $2, $3, $4, $5)
-                """, user_data['user_id'], user_data['username'], user_data['first_name'],
+                """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
                     user_data['last_name'], user_data['photo_url'])
-                user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_data['user_id'])
+                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
             else:
                 # Обновляем информацию
                 await conn.execute("""
                     UPDATE users SET username = $2, first_name = $3, last_name = $4, photo_url = $5
-                    WHERE user_id = $1
-                """, user_data['user_id'], user_data['username'], user_data['first_name'],
+                    WHERE telegram_id = $1
+                """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
                     user_data['last_name'], user_data['photo_url'])
             
             # Получаем актуальное количество опубликованных постов
             published_count = await conn.fetchval("""
                 SELECT COUNT(*) FROM posts 
-                WHERE user_id = $1 AND status = 'approved'
-            """, user_data['user_id'])
+                WHERE telegram_id = $1 AND status = 'approved'
+            """, user_data['telegram_id'])
             
             # Кешируем пользователя
             user_dict = dict(user)
             user_dict['published_posts'] = published_count
-            user_cache[user_data['user_id']] = user_dict
+            user_cache[user_data['telegram_id']] = user_dict
             return user_dict
 
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
         async with get_db_connection() as conn:
             post_id = await conn.fetchval("""
-                INSERT INTO posts (user_id, description, category, tags, creator, status)
+                INSERT INTO posts (telegram_id, description, category, tags, creator, status)
                 VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id
-            """, post_data['user_id'], post_data['description'], post_data['category'],
+            """, post_data['telegram_id'], post_data['description'], post_data['category'],
                 json.dumps(post_data['tags']), json.dumps(post_data['creator']))
             
             # Увеличиваем счетчик постов пользователя
             await conn.execute("""
-                UPDATE users SET posts_today = posts_today + 1 WHERE user_id = $1
-            """, post_data['user_id'])
+                UPDATE users SET posts_today = posts_today + 1 WHERE telegram_id = $1
+            """, post_data['telegram_id'])
             
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             post_dict = dict(post)
@@ -225,13 +225,13 @@ class DatabaseService:
             return post_dict
 
     @staticmethod
-    async def get_posts(filters: Dict, page: int, limit: int, search: str = '', user_id: int = None) -> List[Dict]:
+    async def get_posts(filters: Dict, page: int, limit: int, search: str = '', telegram_id: int = None) -> List[Dict]:
         async with get_db_connection() as conn:
             query = """
                 SELECT p.*, 
                        (CASE WHEN $10::BIGINT = ANY(u.liked) THEN TRUE ELSE FALSE END) as user_liked
                 FROM posts p
-                LEFT JOIN users u ON u.user_id = $10
+                LEFT JOIN users u ON u.telegram_id = $10
                 WHERE p.status = 'approved'
             """
             params = [filters.get('category', '')]
@@ -261,15 +261,15 @@ class DatabaseService:
             # Специальные фильтры
             if filters.get('filters', {}).get('sort'):
                 sort_type = filters['filters']['sort']
-                if sort_type == 'my' and user_id:
-                    query += f" AND p.user_id = ${len(params) + 1}"
-                    params.append(user_id)
-                elif sort_type == 'favorites' and user_id:
-                    query += f" AND p.id = ANY((SELECT favorites FROM users WHERE user_id = ${len(params) + 1}))"
-                    params.append(user_id)
-                elif sort_type == 'hidden' and user_id:
-                    query += f" AND p.id = ANY((SELECT hidden FROM users WHERE user_id = ${len(params) + 1}))"
-                    params.append(user_id)
+                if sort_type == 'my' and telegram_id:
+                    query += f" AND p.telegram_id = ${len(params) + 1}"
+                    params.append(telegram_id)
+                elif sort_type == 'favorites' and telegram_id:
+                    query += f" AND p.id = ANY((SELECT favorites FROM users WHERE telegram_id = ${len(params) + 1}))"
+                    params.append(telegram_id)
+                elif sort_type == 'hidden' and telegram_id:
+                    query += f" AND p.id = ANY((SELECT hidden FROM users WHERE telegram_id = ${len(params) + 1}))"
+                    params.append(telegram_id)
             
             # Сортировка
             sort_type = filters.get('filters', {}).get('sort', 'new')
@@ -286,7 +286,7 @@ class DatabaseService:
             
             query += f" LIMIT {limit} OFFSET {(page - 1) * limit}"
             
-            posts = await conn.fetch(query, *params[:9], user_id)
+            posts = await conn.fetch(query, *params[:9], telegram_id)
             result = [dict(post) for post in posts]
             
             # Кешируем полученные посты
@@ -318,10 +318,10 @@ class DatabaseService:
             return None
 
     @staticmethod
-    async def delete_post(post_id: int, user_id: int = None) -> bool:
+    async def delete_post(post_id: int, telegram_id: int = None) -> bool:
         async with get_db_connection() as conn:
-            if user_id:
-                result = await conn.execute("DELETE FROM posts WHERE id = $1 AND user_id = $2", post_id, user_id)
+            if telegram_id:
+                result = await conn.execute("DELETE FROM posts WHERE id = $1 AND telegram_id = $2", post_id, telegram_id)
             else:
                 result = await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
             
@@ -330,10 +330,10 @@ class DatabaseService:
             return result.split()[-1] == '1'
 
     @staticmethod
-    async def like_post(post_id: int, user_id: int) -> Optional[Dict]:
+    async def like_post(post_id: int, telegram_id: int) -> Optional[Dict]:
         async with get_db_connection() as conn:
             # Проверяем, лайкал ли пользователь этот пост
-            user = await conn.fetchrow("SELECT liked FROM users WHERE user_id = $1", user_id)
+            user = await conn.fetchrow("SELECT liked FROM users WHERE telegram_id = $1", telegram_id)
             if not user:
                 return None
             
@@ -342,8 +342,8 @@ class DatabaseService:
             if post_id in liked_posts:
                 # Убираем лайк
                 await conn.execute("""
-                    UPDATE users SET liked = array_remove(liked, $1) WHERE user_id = $2
-                """, post_id, user_id)
+                    UPDATE users SET liked = array_remove(liked, $1) WHERE telegram_id = $2
+                """, post_id, telegram_id)
                 await conn.execute("""
                     UPDATE posts SET likes = likes - 1 WHERE id = $1 AND status = 'approved'
                 """, post_id)
@@ -351,8 +351,8 @@ class DatabaseService:
             else:
                 # Ставим лайк
                 await conn.execute("""
-                    UPDATE users SET liked = array_append(liked, $1) WHERE user_id = $2
-                """, post_id, user_id)
+                    UPDATE users SET liked = array_append(liked, $1) WHERE telegram_id = $2
+                """, post_id, telegram_id)
                 await conn.execute("""
                     UPDATE posts SET likes = likes + 1 WHERE id = $1 AND status = 'approved'
                 """, post_id)
@@ -371,7 +371,7 @@ class DatabaseService:
     async def report_post(post_id: int, reporter_id: int, reason: str = None) -> Dict:
         async with get_db_connection() as conn:
             # Проверяем, жаловался ли пользователь на этот пост
-            user = await conn.fetchrow("SELECT reported_posts FROM users WHERE user_id = $1", reporter_id)
+            user = await conn.fetchrow("SELECT reported_posts FROM users WHERE telegram_id = $1", reporter_id)
             if user and user['reported_posts'] and post_id in user['reported_posts']:
                 return {'success': False, 'message': 'already_reported'}
             
@@ -382,7 +382,7 @@ class DatabaseService:
             
             # Добавляем пост в список пожалованных пользователем
             await conn.execute("""
-                UPDATE users SET reported_posts = array_append(reported_posts, $1) WHERE user_id = $2
+                UPDATE users SET reported_posts = array_append(reported_posts, $1) WHERE telegram_id = $2
             """, post_id, reporter_id)
             
             return {'success': True, 'message': 'reported'}
@@ -402,9 +402,9 @@ class DatabaseService:
             return None
 
     @staticmethod
-    async def add_to_favorites(post_id: int, user_id: int) -> Dict:
+    async def add_to_favorites(post_id: int, telegram_id: int) -> Dict:
         async with get_db_connection() as conn:
-            user = await conn.fetchrow("SELECT favorites FROM users WHERE user_id = $1", user_id)
+            user = await conn.fetchrow("SELECT favorites FROM users WHERE telegram_id = $1", telegram_id)
             if not user:
                 return {'success': False, 'message': 'user_not_found'}
             
@@ -413,20 +413,20 @@ class DatabaseService:
             if post_id in favorites:
                 # Убираем из избранного
                 await conn.execute("""
-                    UPDATE users SET favorites = array_remove(favorites, $1) WHERE user_id = $2
-                """, post_id, user_id)
+                    UPDATE users SET favorites = array_remove(favorites, $1) WHERE telegram_id = $2
+                """, post_id, telegram_id)
                 return {'success': True, 'action': 'removed', 'message': 'removed_from_favorites'}
             else:
                 # Добавляем в избранное
                 await conn.execute("""
-                    UPDATE users SET favorites = array_append(favorites, $1) WHERE user_id = $2
-                """, post_id, user_id)
+                    UPDATE users SET favorites = array_append(favorites, $1) WHERE telegram_id = $2
+                """, post_id, telegram_id)
                 return {'success': True, 'action': 'added', 'message': 'added_to_favorites'}
 
     @staticmethod
-    async def hide_post(post_id: int, user_id: int) -> Dict:
+    async def hide_post(post_id: int, telegram_id: int) -> Dict:
         async with get_db_connection() as conn:
-            user = await conn.fetchrow("SELECT hidden FROM users WHERE user_id = $1", user_id)
+            user = await conn.fetchrow("SELECT hidden FROM users WHERE telegram_id = $1", telegram_id)
             if not user:
                 return {'success': False, 'message': 'user_not_found'}
             
@@ -435,61 +435,61 @@ class DatabaseService:
             if post_id in hidden:
                 # Показываем пост
                 await conn.execute("""
-                    UPDATE users SET hidden = array_remove(hidden, $1) WHERE user_id = $2
-                """, post_id, user_id)
+                    UPDATE users SET hidden = array_remove(hidden, $1) WHERE telegram_id = $2
+                """, post_id, telegram_id)
                 return {'success': True, 'action': 'shown', 'message': 'post_shown'}
             else:
                 # Скрываем пост
                 await conn.execute("""
-                    UPDATE users SET hidden = array_append(hidden, $1) WHERE user_id = $2
-                """, post_id, user_id)
+                    UPDATE users SET hidden = array_append(hidden, $1) WHERE telegram_id = $2
+                """, post_id, telegram_id)
                 return {'success': True, 'action': 'hidden', 'message': 'post_hidden'}
 
     @staticmethod
-    async def is_user_banned(user_id: int) -> bool:
+    async def is_user_banned(telegram_id: int) -> bool:
         # Проверяем кеш
-        if user_id in user_cache:
-            return user_cache[user_id].get('is_banned', False)
+        if telegram_id in user_cache:
+            return user_cache[telegram_id].get('is_banned', False)
         
         async with get_db_connection() as conn:
-            result = await conn.fetchval("SELECT is_banned FROM users WHERE user_id = $1", user_id)
+            result = await conn.fetchval("SELECT is_banned FROM users WHERE telegram_id = $1", telegram_id)
             return result or False
 
     @staticmethod
-    async def get_user_posts_today(user_id: int) -> int:
+    async def get_user_posts_today(telegram_id: int) -> int:
         # Проверяем кеш
-        if user_id in user_cache:
-            return user_cache[user_id].get('posts_today', 0)
+        if telegram_id in user_cache:
+            return user_cache[telegram_id].get('posts_today', 0)
         
         async with get_db_connection() as conn:
-            result = await conn.fetchval("SELECT posts_today FROM users WHERE user_id = $1", user_id)
+            result = await conn.fetchval("SELECT posts_today FROM users WHERE telegram_id = $1", telegram_id)
             return result or 0
 
     @staticmethod
-    async def get_user_limit(user_id: int) -> int:
+    async def get_user_limit(telegram_id: int) -> int:
         # Проверяем кеш
-        if user_id in user_cache:
-            return user_cache[user_id].get('post_limit', config.DAILY_POST_LIMIT)
+        if telegram_id in user_cache:
+            return user_cache[telegram_id].get('post_limit', config.DAILY_POST_LIMIT)
         
         async with get_db_connection() as conn:
-            result = await conn.fetchval("SELECT post_limit FROM users WHERE user_id = $1", user_id)
+            result = await conn.fetchval("SELECT post_limit FROM users WHERE telegram_id = $1", telegram_id)
             return result or config.DAILY_POST_LIMIT
 
     @staticmethod
-    async def get_user_published_posts_count(user_id: int) -> int:
+    async def get_user_published_posts_count(telegram_id: int) -> int:
         async with get_db_connection() as conn:
             result = await conn.fetchval("""
                 SELECT COUNT(*) FROM posts 
-                WHERE user_id = $1 AND status = 'approved'
-            """, user_id)
+                WHERE telegram_id = $1 AND status = 'approved'
+            """, telegram_id)
             return result or 0
 
 # Система лимитов (в памяти)
 class PostLimitService:
     @staticmethod
-    async def check_user_limit(user_id: int) -> bool:
-        posts_today = await DatabaseService.get_user_posts_today(user_id)
-        limit = await DatabaseService.get_user_limit(user_id)
+    async def check_user_limit(telegram_id: int) -> bool:
+        posts_today = await DatabaseService.get_user_posts_today(telegram_id)
+        limit = await DatabaseService.get_user_limit(telegram_id)
         return posts_today < limit
 
 # Telegram Bot
@@ -546,7 +546,7 @@ class ModerationBot:
                 try:
                     creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
                     await telegram_bot.send_message(
-                        chat_id=creator['user_id'],
+                        chat_id=creator['telegram_id'],
                         text="🗑 Ваше объявление было удалено модератором"
                     )
                 except Exception as e:
@@ -592,7 +592,7 @@ class ModerationBot:
             try:
                 creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
                 await telegram_bot.send_message(
-                    chat_id=creator['user_id'],
+                    chat_id=creator['telegram_id'],
                     text="❌ Ваше объявление было отклонено модератором за нарушение правил"
                 )
             except Exception as e:
@@ -611,7 +611,7 @@ class ModerationBot:
             text = (
                 f"📝 Новое объявление #{post['id']}\n\n"
                 f"👤 От: {creator['first_name']} {creator.get('last_name', '')}\n"
-                f"🆔 ID: {creator['user_id']}\n"
+                f"🆔 ID: {creator['telegram_id']}\n"
                 f"👤 Username: @{creator.get('username', 'нет')}\n"
                 f"📂 Категория: {post['category']}\n\n"
                 f"📄 Текст:\n{post['description']}\n\n"
@@ -646,10 +646,10 @@ class ModerationBot:
             text = (
                 f"🚨 ЖАЛОБА НА ОБЪЯВЛЕНИЕ #{post['id']}\n\n"
                 f"👤 Автор объявления: {creator['first_name']} {creator.get('last_name', '')}\n"
-                f"🆔 ID автора: {creator['user_id']}\n"
+                f"🆔 ID автора: {creator['telegram_id']}\n"
                 f"👤 Username автора: @{creator.get('username', 'нет')}\n\n"
                 f"🚨 Жалобу подал: {reporter_data['first_name']} {reporter_data.get('last_name', '')}\n"
-                f"🆔 ID жалобщика: {reporter_data['user_id']}\n"
+                f"🆔 ID жалобщика: {reporter_data['telegram_id']}\n"
                 f"👤 Username жалобщика: @{reporter_data.get('username', 'нет')}\n\n"
                 f"📂 Категория: {post['category']}\n"
                 f"📄 Текст объявления:\n{post['description']}\n\n"
@@ -716,10 +716,10 @@ async def handle_websocket(websocket: WebSocketServerProtocol):
 
 async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dict):
     action = data.get('type')
-    user_id = data.get('user_id')
+    telegram_id = data.get('telegram_id')
     
     # Проверяем бан
-    if user_id and await DatabaseService.is_user_banned(user_id):
+    if telegram_id and await DatabaseService.is_user_banned(telegram_id):
         await websocket.send(json.dumps({
             'type': 'banned',
             'message': 'Ваш аккаунт заблокирован'
@@ -728,10 +728,10 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
     
     if action == 'sync_user':
         user_data = await DatabaseService.sync_user(data)
-        published_count = await DatabaseService.get_user_published_posts_count(user_id)
+        published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
         await websocket.send(json.dumps({
             'type': 'user_synced',
-            'user_id': user_data['user_id'],
+            'telegram_id': user_data['telegram_id'],
             'limits': {
                 'used': published_count,
                 'total': user_data.get('post_limit', config.DAILY_POST_LIMIT)
@@ -741,7 +741,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
     
     elif action == 'create_post':
         # Проверка лимита
-        if not await PostLimitService.check_user_limit(user_id):
+        if not await PostLimitService.check_user_limit(telegram_id):
             await websocket.send(json.dumps({
                 'type': 'limit_exceeded',
                 'message': f'Достигнут дневной лимит объявлений'
@@ -750,7 +750,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         
         # Создание поста
         post = await DatabaseService.create_post({
-            'user_id': user_id,
+            'telegram_id': telegram_id,
             'description': data['description'],
             'category': data['category'],
             'tags': data['tags'],
@@ -763,8 +763,8 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             await moderation_bot.send_for_moderation(post)
         
         # Получаем обновленное количество опубликованных постов
-        published_count = await DatabaseService.get_user_published_posts_count(user_id)
-        limit = await DatabaseService.get_user_limit(user_id)
+        published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+        limit = await DatabaseService.get_user_limit(telegram_id)
         
         await websocket.send(json.dumps({
             'type': 'post_created',
@@ -777,7 +777,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
     
     elif action == 'get_posts':
         posts = await DatabaseService.get_posts(
-            data, data['page'], data['limit'], data.get('search', ''), user_id
+            data, data['page'], data['limit'], data.get('search', ''), telegram_id
         )
         await websocket.send(json.dumps({
             'type': 'posts',
@@ -786,17 +786,17 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         }))
     
     elif action == 'like_post':
-        post = await DatabaseService.like_post(data['post_id'], user_id)
+        post = await DatabaseService.like_post(data['post_id'], telegram_id)
         if post:
             # Отправляем только этому пользователю обновление
             await websocket.send(json.dumps({'type': 'post_updated', 'post': post}))
     
     elif action == 'delete_post':
-        success = await DatabaseService.delete_post(data['post_id'], user_id)
+        success = await DatabaseService.delete_post(data['post_id'], telegram_id)
         if success:
             # Получаем обновленное количество опубликованных постов
-            published_count = await DatabaseService.get_user_published_posts_count(user_id)
-            limit = await DatabaseService.get_user_limit(user_id)
+            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+            limit = await DatabaseService.get_user_limit(telegram_id)
             
             await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
             await websocket.send(json.dumps({
@@ -812,7 +812,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         if post:
             result = await DatabaseService.report_post(
                 data['post_id'], 
-                user_id, 
+                telegram_id, 
                 data.get('reason')
             )
             
@@ -827,7 +827,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                     if telegram_bot:
                         moderation_bot = ModerationBot()
                         reporter_data = {
-                            'user_id': user_id,
+                            'telegram_id': telegram_id,
                             'first_name': data.get('reporter_first_name', ''),
                             'last_name': data.get('reporter_last_name', ''),
                             'username': data.get('reporter_username', '')
@@ -840,7 +840,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
                     }))
     
     elif action == 'add_to_favorites':
-        result = await DatabaseService.add_to_favorites(data['post_id'], user_id)
+        result = await DatabaseService.add_to_favorites(data['post_id'], telegram_id)
         await websocket.send(json.dumps({
             'type': 'favorites_updated',
             'action': result['action'],
@@ -848,7 +848,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         }))
     
     elif action == 'hide_post':
-        result = await DatabaseService.hide_post(data['post_id'], user_id)
+        result = await DatabaseService.hide_post(data['post_id'], telegram_id)
         await websocket.send(json.dumps({
             'type': 'hide_updated',
             'action': result['action'],
