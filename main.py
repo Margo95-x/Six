@@ -271,11 +271,9 @@ class DatabaseService:
                     params.append(telegram_id)
                     query += f" AND p.telegram_id = ${len(params)}"
                 elif sort_type == 'favorites' and telegram_id:
-                    params.append(telegram_id)
-                    query += f" AND p.id = ANY((SELECT COALESCE(favorites, ARRAY[]::BIGINT[]) FROM users WHERE telegram_id = ${len(params)}))"
+                    query += " AND p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[]))"
                 elif sort_type == 'hidden' and telegram_id:
-                    params.append(telegram_id)
-                    query += f" AND p.id = ANY((SELECT COALESCE(hidden, ARRAY[]::BIGINT[]) FROM users WHERE telegram_id = ${len(params)}))"
+                    query += " AND p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[]))"
             
             # Сортировка
             sort_type = filters.get('filters', {}).get('sort', 'new')
@@ -306,7 +304,8 @@ class DatabaseService:
                         description = $2,
                         category = $3,
                         tags = $4,
-                        updated_at = CURRENT_TIMESTAMP
+                        updated_at = CURRENT_TIMESTAMP,
+                        status = 'approved'
                     WHERE id = $1
                 """, post['original_post_id'], post['description'], post['category'], post['tags'])
                 
@@ -417,7 +416,7 @@ class DatabaseService:
             if post_id in favorites:
                 # Убираем из избранного
                 await conn.execute("""
-                    UPDATE users SET favorites = array_remove(favorites, $1) WHERE telegram_id = $2
+                    UPDATE users SET favorites = array_remove(COALESCE(favorites, ARRAY[]::BIGINT[]), $1) WHERE telegram_id = $2
                 """, post_id, telegram_id)
                 return {'success': True, 'action': 'removed', 'message': 'removed_from_favorites'}
             else:
@@ -439,7 +438,7 @@ class DatabaseService:
             if post_id in hidden:
                 # Показываем пост
                 await conn.execute("""
-                    UPDATE users SET hidden = array_remove(hidden, $1) WHERE telegram_id = $2
+                    UPDATE users SET hidden = array_remove(COALESCE(hidden, ARRAY[]::BIGINT[]), $1) WHERE telegram_id = $2
                 """, post_id, telegram_id)
                 return {'success': True, 'action': 'shown', 'message': 'post_shown'}
             else:
@@ -999,8 +998,10 @@ async def handle_websocket_message(ws, data: Dict):
         elif action == 'like_post':
             post = await DatabaseService.like_post(data['post_id'], telegram_id)
             if post:
-                await ws.send_str(json.dumps({'type': 'post_updated', 'post': post}, default=str))
+                # Отправляем обновление всем клиентам
+                await broadcast_message({'type': 'post_updated', 'post': post})
         
+
         elif action == 'delete_post':
             success = await DatabaseService.delete_post(data['post_id'], telegram_id)
             if success:
@@ -1069,7 +1070,18 @@ async def handle_websocket_message(ws, data: Dict):
                 'action': result['action'],
                 'message': result['message']
             }, default=str))
-        
+            # Перезагружаем посты если нужно
+            if result['success']:
+                await asyncio.sleep(0.1)  # Небольшая задержка
+                posts = await DatabaseService.get_posts(
+                    {'filters': {'sort': 'new'}}, 1, 20, '', telegram_id
+                )
+                await ws.send_str(json.dumps({
+                    'type': 'posts',
+                    'posts': posts,
+                    'append': False
+                }, default=str))
+
         elif action == 'hide_post':
             result = await DatabaseService.hide_post(data['post_id'], telegram_id)
             await ws.send_str(json.dumps({
@@ -1077,6 +1089,17 @@ async def handle_websocket_message(ws, data: Dict):
                 'action': result['action'],
                 'message': result['message']
             }, default=str))
+            # Перезагружаем посты если нужно
+            if result['success']:
+                await asyncio.sleep(0.1)  # Небольшая задержка
+                posts = await DatabaseService.get_posts(
+                    {'filters': {'sort': 'new'}}, 1, 20, '', telegram_id
+                )
+                await ws.send_str(json.dumps({
+                    'type': 'posts',
+                    'posts': posts,
+                    'append': False
+                }, default=str))
             
     except Exception as e:
         logger.error(f"Error handling websocket message: {e}")
