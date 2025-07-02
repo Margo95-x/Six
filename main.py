@@ -765,7 +765,7 @@ class ModerationBot:
                 if approved_post:
                     # Отправляем broadcast ВСЕМ клиентам о новом/обновленном посте
                     await broadcast_message({
-                        'type': 'post_updated',
+                        'type': 'post_approved',
                         'post': approved_post
                     })
                     
@@ -998,14 +998,14 @@ async def handle_websocket_message(ws, data: Dict):
             
             message_text = 'Изменения отправлены на модерацию' if data.get('is_edit') else 'Объявление отправлено на модерацию'
             
-            await ws.send_str(json.dumps({
-                'type': 'post_created',
-                'message': message_text,
+            await broadcast_message({
+                'type': 'user_limits_updated',
+                'telegram_id': telegram_id,
                 'limits': {
                     'used': published_count,
                     'total': limit
                 }
-            }, default=str))
+            })
         
         elif action == 'get_posts':
             posts = await DatabaseService.get_posts(
