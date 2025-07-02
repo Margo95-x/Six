@@ -241,9 +241,9 @@ class DatabaseService:
             if telegram_id:
                 query = """
                     SELECT p.*, 
-                           (CASE WHEN p.id = ANY(COALESCE(u.liked, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_liked,
-                           (CASE WHEN p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_favorited,
-                           (CASE WHEN p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_hidden
+                        (CASE WHEN p.id = ANY(COALESCE(u.liked, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_liked,
+                        (CASE WHEN p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_favorited,
+                        (CASE WHEN p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_hidden
                     FROM posts p
                     LEFT JOIN users u ON u.telegram_id = $1
                     WHERE p.status = 'approved'
@@ -256,6 +256,10 @@ class DatabaseService:
                     WHERE p.status = 'approved'
                 """
                 params = []
+            
+            # ИСПРАВЛЕНИЕ: фильтруем скрытые посты для обычного просмотра
+            if filters.get('filters', {}).get('sort') != 'hidden' and telegram_id:
+                query += " AND (p.id <> ALL(COALESCE(u.hidden, ARRAY[]::BIGINT[])))"
             
             # Категория
             if filters.get('category'):
@@ -957,7 +961,10 @@ async def handle_websocket_message(ws, data: Dict):
                     'total': user_data_result.get('post_limit', config.DAILY_POST_LIMIT)
                 },
                 'is_banned': user_data_result.get('is_banned', False),
-                'language': user_data_result.get('language', 'ru')
+                'language': user_data_result.get('language', 'ru'),
+                'favorites': user_data_result.get('favorites', []),
+                'hidden': user_data_result.get('hidden', []),
+                'liked': user_data_result.get('liked', [])
             }, default=str))
         
         elif action == 'create_post':
