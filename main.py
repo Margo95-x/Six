@@ -921,16 +921,10 @@ async def handle_websocket_message(ws, data: Dict):
                 moderation_bot = ModerationBot()
                 await moderation_bot.send_for_moderation(post)
             
-            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
-            limit = await DatabaseService.get_user_limit(telegram_id)
-            
+            # При создании НЕ обновляем лимиты, только отправляем подтверждение
             await ws.send_str(json.dumps({
                 'type': 'post_created',
-                'message': 'Изменения отправлены на модерацию' if data.get('is_edit') else 'Объявление отправлено на модерацию',
-                'limits': {
-                    'used': published_count,
-                    'total': limit
-                }
+                'message': 'Изменения отправлены на модерацию' if data.get('is_edit') else 'Объявление отправлено на модерацию'
             }, default=str))
         
         elif action == 'get_posts':
@@ -1009,6 +1003,19 @@ async def handle_websocket_message(ws, data: Dict):
                             'type': 'report_sent',
                             'message': 'Жалоба отправлена модераторам'
                         }, default=str))
+        
+        elif action == 'get_user_limits':
+            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+            limit = await DatabaseService.get_user_limit(telegram_id)
+            
+            await ws.send_str(json.dumps({
+                'type': 'user_limits_updated',
+                'telegram_id': telegram_id,
+                'limits': {
+                    'used': published_count,
+                    'total': limit
+                }
+            }, default=str))
         
         elif action == 'add_to_favorites':
             result = await DatabaseService.add_to_favorites(data['post_id'], telegram_id)
