@@ -202,7 +202,18 @@ class DatabaseService:
             user_dict = dict(user)
             user_dict['published_posts'] = published_count
             user_cache[user_data['telegram_id']] = user_dict
-            return user_dict
+            return {
+                'telegram_id': user_dict['telegram_id'],
+                'limits': {
+                    'used': published_count,
+                    'total': user_dict.get('post_limit', config.DAILY_POST_LIMIT)
+                },
+                'is_banned': user_dict.get('is_banned', False),
+                'language': user_dict.get('language', 'ru'),
+                'favorites': user_dict.get('favorites', []),
+                'hidden': user_dict.get('hidden', []),
+                'liked': user_dict.get('liked', [])
+            }
 
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
@@ -748,6 +759,7 @@ class ModerationBot:
             if action == "approve":
                 approved_post = await DatabaseService.approve_post(post_id)
                 if approved_post:
+                    # Отправляем broadcast ВСЕМ клиентам о новом/обновленном посте
                     await broadcast_message({
                         'type': 'post_updated',
                         'post': approved_post
@@ -762,7 +774,10 @@ class ModerationBot:
                     
                     # Изменяем сообщение модерации
                     new_text = query.message.text + f"\n\n✅ Объявление опубликовано\n🆔 ID объявления: {approved_post['id']}"
-                    await query.edit_message_text(new_text)
+                    if new_text != query.message.text:
+                        await query.edit_message_text(new_text)
+                    else:
+                        await query.answer("Действие выполнено")
                 else:
                     await query.edit_message_text("❌ Ошибка при одобрении")
                     
