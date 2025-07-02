@@ -1033,12 +1033,22 @@ async def handle_websocket_message(ws, data: Dict):
                 
                 await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
                 await ws.send_str(json.dumps({
-                    'type': 'limits_updated',
+                    'type': 'post_created',
+                    'message': message_text,
                     'limits': {
                         'used': published_count,
                         'total': limit
                     }
                 }, default=str))
+
+                await broadcast_message({
+                    'type': 'user_limits_updated',
+                    'telegram_id': telegram_id,
+                    'limits': {
+                        'used': published_count,
+                        'total': limit
+                    }
+                })
         
         elif action == 'get_post_for_edit':
             post = await DatabaseService.get_post_by_id(data['post_id'])
