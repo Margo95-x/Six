@@ -924,15 +924,6 @@ async def handle_websocket_message(ws, data: Dict):
             published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
             limit = await DatabaseService.get_user_limit(telegram_id)
             
-            await broadcast_message({
-                'type': 'user_limits_updated',
-                'telegram_id': telegram_id,
-                'limits': {
-                    'used': published_count,
-                    'total': limit
-                }
-            })
-            
             await ws.send_str(json.dumps({
                 'type': 'post_created',
                 'message': 'Изменения отправлены на модерацию' if data.get('is_edit') else 'Объявление отправлено на модерацию',
@@ -965,14 +956,15 @@ async def handle_websocket_message(ws, data: Dict):
                 
                 await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
                 
-                await broadcast_message({
+                # Отправляем обновление лимитов обратно пользователю
+                await ws.send_str(json.dumps({
                     'type': 'user_limits_updated',
                     'telegram_id': telegram_id,
                     'limits': {
                         'used': published_count,
                         'total': limit
                     }
-                })
+                }, default=str))
         
         elif action == 'get_post_for_edit':
             post = await DatabaseService.get_post_by_id(data['post_id'])
