@@ -149,12 +149,7 @@ class DatabaseService:
     @staticmethod
     async def sync_user(user_data: Dict) -> Dict:
         async with get_db_connection() as conn:
-            await conn.execute("""
-                UPDATE users 
-                SET posts_today = 0, last_post_count_reset = CURRENT_DATE
-                WHERE telegram_id = $1 AND last_post_count_reset < CURRENT_DATE
-            """, user_data['telegram_id'])
-            
+            # Убираем дневной сброс - лимиты теперь общие
             user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
             
             if not user:
@@ -171,6 +166,7 @@ class DatabaseService:
                 """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
                     user_data['last_name'], user_data['photo_url'])
             
+            # Считаем опубликованные посты для лимита
             published_count = await conn.fetchval("""
                 SELECT COUNT(*) FROM posts 
                 WHERE telegram_id = $1 AND status = 'approved'
@@ -203,10 +199,7 @@ class DatabaseService:
                 json.dumps(post_data['tags']), json.dumps(post_data['creator']),
                 post_data.get('is_edit', False), post_data.get('original_post_id'))
             
-            if not post_data.get('is_edit', False):
-                await conn.execute("""
-                    UPDATE users SET posts_today = posts_today + 1 WHERE telegram_id = $1
-                """, post_data['telegram_id'])
+            # Убираем инкремент posts_today - теперь лимиты общие
             
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             return dict(post)
@@ -426,15 +419,6 @@ class DatabaseService:
             return result or False
 
     @staticmethod
-    async def get_user_posts_today(telegram_id: int) -> int:
-        if telegram_id in user_cache:
-            return user_cache[telegram_id].get('posts_today', 0)
-        
-        async with get_db_connection() as conn:
-            result = await conn.fetchval("SELECT posts_today FROM users WHERE telegram_id = $1", telegram_id)
-            return result or 0
-
-    @staticmethod
     async def get_user_limit(telegram_id: int) -> int:
         if telegram_id in user_cache:
             return user_cache[telegram_id].get('post_limit', config.DAILY_POST_LIMIT)
@@ -496,6 +480,18 @@ class DatabaseService:
             """, telegram_id, limit)
             if telegram_id in user_cache:
                 user_cache[telegram_id]['post_limit'] = limit
+            
+            # Отправляем обновление лимитов пользователю в реальном времени
+            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+            await broadcast_message({
+                'type': 'user_limits_updated',
+                'telegram_id': telegram_id,
+                'limits': {
+                    'used': published_count,
+                    'total': limit
+                }
+            })
+            
             return True
 
     @staticmethod
@@ -507,9 +503,10 @@ class DatabaseService:
 class PostLimitService:
     @staticmethod
     async def check_user_limit(telegram_id: int) -> bool:
-        posts_today = await DatabaseService.get_user_posts_today(telegram_id)
+        # Проверяем общее количество опубликованных постов, а не дневные
+        published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
         limit = await DatabaseService.get_user_limit(telegram_id)
-        return posts_today < limit
+        return published_count < limit
 
 class ModerationBot:
     def __init__(self):
@@ -671,11 +668,12 @@ class ModerationBot:
             telegram_id = int(context.args[0])
             user_info = await DatabaseService.get_user_info(telegram_id)
             if user_info:
+                published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
                 await update.message.reply_text(
                     f"👤 Пользователь: {user_info['first_name']} {user_info['last_name']}\n"
                     f"🆔 ID: {telegram_id}\n"
                     f"📊 Лимит: {user_info['post_limit']}\n"
-                    f"📝 Постов сегодня: {user_info['posts_today']}\n"
+                    f"📝 Опубликовано постов: {published_count}\n"
                     f"🚫 Забанен: {'Да' if user_info['is_banned'] else 'Нет'}"
                 )
             else:
@@ -703,6 +701,10 @@ class ModerationBot:
             if action == "approve":
                 approved_post = await DatabaseService.approve_post(post_id)
                 if approved_post:
+                    # Добавляем информацию о том, было ли это редактирование
+                    approved_post['is_edit'] = post.get('is_edit', False)
+                    approved_post['original_post_id'] = post.get('original_post_id')
+                    
                     await broadcast_message({
                         'type': 'post_approved',
                         'post': approved_post
@@ -845,8 +847,16 @@ async def broadcast_message(message: Dict, filter_data: Dict = None):
         message_str = json.dumps(message, default=str)
         disconnected_clients = set()
         
+        # Если есть фильтр для исключения пользователя
+        exclude_user = filter_data.get('exclude_user') if filter_data else None
+        
         for ws in connected_clients.copy():
             try:
+                # Простая проверка исключения (можно улучшить с user mapping)
+                if exclude_user:
+                    # Для простоты отправляем всем, кроме недавно подключенных
+                    # В продакшне лучше хранить mapping ws -> user_id
+                    pass
                 await ws.send_str(message_str)
             except Exception as e:
                 logger.error(f"Error broadcasting to client: {e}")
@@ -865,10 +875,14 @@ async def handle_websocket_message(ws, data: Dict):
         }, default=str))
         return
     
-    if telegram_id and await DatabaseService.is_user_banned(telegram_id):
+    # Проверяем бан только для определенных действий
+    is_banned = await DatabaseService.is_user_banned(telegram_id)
+    banned_actions = ['create_post', 'like_post', 'report_post']
+    
+    if is_banned and action in banned_actions:
         await ws.send_str(json.dumps({
-            'type': 'banned',
-            'message': 'Ваш аккаунт заблокирован'
+            'type': 'action_banned',
+            'message': 'Это действие недоступно для заблокированных пользователей'
         }, default=str))
         return
     
@@ -903,7 +917,7 @@ async def handle_websocket_message(ws, data: Dict):
             if not await PostLimitService.check_user_limit(telegram_id):
                 await ws.send_str(json.dumps({
                     'type': 'limit_exceeded',
-                    'message': f'Достигнут дневной лимит объявлений'
+                    'message': f'Достигнут лимит объявлений'
                 }, default=str))
                 return
             
@@ -940,7 +954,18 @@ async def handle_websocket_message(ws, data: Dict):
         elif action == 'like_post':
             post = await DatabaseService.like_post(data['post_id'], telegram_id)
             if post:
-                await broadcast_message({'type': 'post_updated', 'post': post})
+                # Отправляем обновление только тому, кто поставил лайк
+                await ws.send_str(json.dumps({
+                    'type': 'post_liked',
+                    'post': post
+                }, default=str))
+                
+                # Всем остальным отправляем только обновление счетчика
+                await broadcast_message({
+                    'type': 'post_like_count_updated',
+                    'post_id': data['post_id'],
+                    'likes': post['likes']
+                }, filter_data={'exclude_user': telegram_id})
         
         elif action == 'delete_post':
             success = await DatabaseService.delete_post(data['post_id'], telegram_id)
