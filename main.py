@@ -450,6 +450,9 @@ class DatabaseService:
     @staticmethod
     async def hard_ban_user(telegram_id: int, reason: str = None) -> bool:
         async with get_db_connection() as conn:
+            # Получаем все посты пользователя перед удалением
+            user_posts = await conn.fetch("SELECT id FROM posts WHERE telegram_id = $1", telegram_id)
+            
             await conn.execute("""
                 UPDATE users SET is_banned = TRUE, ban_reason = $2 WHERE telegram_id = $1
             """, telegram_id, reason)
@@ -459,7 +462,9 @@ class DatabaseService:
             if telegram_id in user_cache:
                 user_cache[telegram_id]['is_banned'] = True
                 user_cache[telegram_id]['ban_reason'] = reason
-            return True
+            
+            # Возвращаем ID удаленных постов для broadcast
+            return [dict(post)['id'] for post in user_posts]
 
     @staticmethod
     async def unban_user(telegram_id: int) -> bool:
@@ -616,7 +621,15 @@ class ModerationBot:
         
         try:
             telegram_id = int(context.args[0])
-            await DatabaseService.hard_ban_user(telegram_id, "Хард-бан модератором")
+            deleted_post_ids = await DatabaseService.hard_ban_user(telegram_id, "Хард-бан модератором")
+            
+            # Отправляем broadcast для каждого удаленного поста
+            for post_id in deleted_post_ids:
+                await broadcast_message({
+                    'type': 'post_deleted',
+                    'post_id': post_id
+                })
+            
             await broadcast_message({
                 'type': 'user_banned',
                 'telegram_id': telegram_id
@@ -847,16 +860,8 @@ async def broadcast_message(message: Dict, filter_data: Dict = None):
         message_str = json.dumps(message, default=str)
         disconnected_clients = set()
         
-        # Если есть фильтр для исключения пользователя
-        exclude_user = filter_data.get('exclude_user') if filter_data else None
-        
         for ws in connected_clients.copy():
             try:
-                # Простая проверка исключения (можно улучшить с user mapping)
-                if exclude_user:
-                    # Для простоты отправляем всем, кроме недавно подключенных
-                    # В продакшне лучше хранить mapping ws -> user_id
-                    pass
                 await ws.send_str(message_str)
             except Exception as e:
                 logger.error(f"Error broadcasting to client: {e}")
@@ -954,18 +959,8 @@ async def handle_websocket_message(ws, data: Dict):
         elif action == 'like_post':
             post = await DatabaseService.like_post(data['post_id'], telegram_id)
             if post:
-                # Отправляем обновление только тому, кто поставил лайк
-                await ws.send_str(json.dumps({
-                    'type': 'post_liked',
-                    'post': post
-                }, default=str))
-                
-                # Всем остальным отправляем только обновление счетчика
-                await broadcast_message({
-                    'type': 'post_like_count_updated',
-                    'post_id': data['post_id'],
-                    'likes': post['likes']
-                }, filter_data={'exclude_user': telegram_id})
+                # Отправляем обновление всем пользователям
+                await broadcast_message({'type': 'post_updated', 'post': post, 'action_user_id': telegram_id})
         
         elif action == 'delete_post':
             success = await DatabaseService.delete_post(data['post_id'], telegram_id)
