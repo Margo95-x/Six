@@ -126,7 +126,7 @@ class DatabaseService:
             
             try:
                 await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'")
-                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_settings JSONB DEFAULT '{"likes": true, "system": true, "account": true}'")
+                await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_settings JSONB DEFAULT \'{"likes": true, "system": true, "account": true}\'')
                 await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS is_edit BOOLEAN DEFAULT FALSE")
                 await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS original_post_id INTEGER")
                 await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
@@ -192,6 +192,9 @@ class DatabaseService:
 
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
+        description = post_data.get('description', '').strip()
+        if len(description) < 10:
+            raise ValueError("Описание поста слишком короткое (менее 10 символов)")
         async with get_db_connection() as conn:
             post_id = await conn.fetchval("""
                 INSERT INTO posts (telegram_id, description, category, tags, creator, status, is_edit, original_post_id)
