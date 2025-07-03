@@ -52,8 +52,10 @@ class DatabaseService:
     async def init_database():
         global db_pool
         if not config.DATABASE_URL:
+            logger.error("DATABASE_URL not set!")
             raise ValueError("DATABASE_URL not set")
         
+        logger.info(f"Attempting to connect to database...")
         database_url = config.DATABASE_URL
         if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
@@ -65,13 +67,18 @@ class DatabaseService:
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
         
-        db_pool = await asyncpg.create_pool(
-            database_url,
-            min_size=config.DB_MIN_SIZE,
-            max_size=config.DB_MAX_SIZE,
-            command_timeout=config.DB_COMMAND_TIMEOUT,
-            ssl=ssl_context
-        )
+        try:
+            db_pool = await asyncpg.create_pool(
+                database_url,
+                min_size=config.DB_MIN_SIZE,
+                max_size=config.DB_MAX_SIZE,
+                command_timeout=config.DB_COMMAND_TIMEOUT,
+                ssl=ssl_context
+            )
+            logger.info("Database pool created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create database pool: {e}")
+            raise
         
         async with get_db_connection() as conn:
             await conn.execute("""
@@ -88,7 +95,7 @@ class DatabaseService:
                     posts BIGINT[] DEFAULT '{}',
                     is_banned BOOLEAN DEFAULT FALSE,
                     ban_reason TEXT,
-                    post_limit INTEGER DEFAULT 60,
+                    post_limit INTEGER DEFAULT 10,
                     last_post_count_reset DATE DEFAULT CURRENT_DATE,
                     posts_today INTEGER DEFAULT 0,
                     language TEXT DEFAULT 'ru',
