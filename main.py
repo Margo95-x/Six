@@ -195,13 +195,28 @@ class DatabaseService:
         async with get_db_connection() as conn:
             post_id = await conn.fetchval("""
                 INSERT INTO posts (telegram_id, description, category, tags, creator, status, is_edit, original_post_id)
-                VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7) RETURNING id
+                VALUES ($1, $2, $3, $4, $5, 'approved', $6, $7) RETURNING id
             """, post_data['telegram_id'], post_data['description'], post_data['category'],
                 json.dumps(post_data['tags']), json.dumps(post_data['creator']),
                 post_data.get('is_edit', False), post_data.get('original_post_id'))
             
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
-            return dict(post)
+            post_dict = dict(post)
+            
+            # Отправляем уведомление о публикации
+            await broadcast_message({
+                'type': 'post_approved',
+                'post': post_dict
+            })
+            
+            # Уведомляем создателя, если включены системные уведомления
+            creator_lang = (await DatabaseService.get_user_info(post_data['telegram_id']))['language'] or 'ru'
+            notification_settings = (await DatabaseService.get_user_info(post_data['telegram_id']))['notification_settings']
+            if notification_settings.get('system'):
+                msg = "Your post has been published!" if creator_lang == 'en' else "Ваше объявление опубликовано!"
+                await telegram_bot.send_message(chat_id=post_data['telegram_id'], text=msg)
+            
+            return post_dict
 
     @staticmethod
     async def get_posts(filters: Dict, page: int, limit: int, search: str = '', telegram_id: int = None) -> List[Dict]:
