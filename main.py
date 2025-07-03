@@ -24,7 +24,7 @@ class Config:
     MODERATION_CHAT_ID: int = int(os.getenv("MODERATION_CHAT_ID", "0"))
     REPORTS_THREAD_ID: int = int(os.getenv("REPORTS_THREAD_ID", "126"))
     PORT: int = int(os.getenv("PORT", "10000"))
-    DAILY_POST_LIMIT: int = 10
+    DAILY_POST_LIMIT: int = 60
     DB_MIN_SIZE: int = 1
     DB_MAX_SIZE: int = 3
     DB_COMMAND_TIMEOUT: int = 30
@@ -40,12 +40,54 @@ user_cache = {}
 
 @asynccontextmanager
 async def get_db_connection():
-    async with db_pool.acquire() as connection:
+    connection = None
+    max_retries = 3
+    retry_delay = 1
+    
+    for attempt in range(max_retries):
         try:
+            if db_pool is None:
+                logger.error("Database pool is not initialized")
+                raise RuntimeError("Database pool is not initialized")
+            
+            connection = await db_pool.acquire()
             yield connection
+            break
+            
+        except (asyncpg.exceptions.ConnectionDoesNotExistError, 
+                asyncpg.exceptions.InterfaceError,
+                asyncpg.exceptions.PostgresConnectionError) as e:
+            logger.warning(f"Database connection attempt {attempt + 1} failed: {e}")
+            
+            if connection:
+                try:
+                    await db_pool.release(connection, timeout=1)
+                except:
+                    pass
+                connection = None
+            
+            if attempt == max_retries - 1:
+                logger.error("All database connection attempts failed")
+                raise
+            
+            await asyncio.sleep(retry_delay)
+            retry_delay *= 2
+            
         except Exception as e:
-            logger.error(f"Database error: {e}")
+            logger.error(f"Unexpected database error: {e}")
+            if connection:
+                try:
+                    await db_pool.release(connection, timeout=1)
+                except:
+                    pass
             raise
+            
+        finally:
+            if connection:
+                try:
+                    await db_pool.release(connection)
+                except Exception as e:
+                    logger.warning(f"Error releasing connection: {e}")
 
 class DatabaseService:
     @staticmethod
@@ -55,30 +97,53 @@ class DatabaseService:
             logger.error("DATABASE_URL not set!")
             raise ValueError("DATABASE_URL not set")
         
-        logger.info(f"Attempting to connect to database...")
         database_url = config.DATABASE_URL
         if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
         
-        ssl_context = None
-        if 'localhost' not in database_url and 'sslmode' not in database_url:
-            import ssl
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+        # Retry logic for database connection
+        max_retries = 5
+        retry_delay = 2
         
-        try:
-            db_pool = await asyncpg.create_pool(
-                database_url,
-                min_size=config.DB_MIN_SIZE,
-                max_size=config.DB_MAX_SIZE,
-                command_timeout=config.DB_COMMAND_TIMEOUT,
-                ssl=ssl_context
-            )
-            logger.info("Database pool created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create database pool: {e}")
-            raise
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Attempting to connect to database (attempt {attempt + 1}/{max_retries})...")
+                
+                ssl_context = None
+                if 'localhost' not in database_url and 'sslmode' not in database_url:
+                    import ssl
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                
+                db_pool = await asyncpg.create_pool(
+                    database_url,
+                    min_size=1,
+                    max_size=2,
+                    command_timeout=60,
+                    server_settings={
+                        'jit': 'off'
+                    },
+                    ssl=ssl_context,
+                    connection_class=asyncpg.Connection
+                )
+                
+                # Test the connection
+                async with db_pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                
+                logger.info("Database pool created and tested successfully")
+                break
+                
+            except Exception as e:
+                logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.error("All database connection attempts failed")
+                    raise
+                
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
         
         async with get_db_connection() as conn:
             await conn.execute("""
@@ -95,7 +160,7 @@ class DatabaseService:
                     posts BIGINT[] DEFAULT '{}',
                     is_banned BOOLEAN DEFAULT FALSE,
                     ban_reason TEXT,
-                    post_limit INTEGER DEFAULT 10,
+                    post_limit INTEGER DEFAULT 60,
                     last_post_count_reset DATE DEFAULT CURRENT_DATE,
                     posts_today INTEGER DEFAULT 0,
                     language TEXT DEFAULT 'ru',
@@ -162,48 +227,71 @@ class DatabaseService:
 
     @staticmethod
     async def sync_user(user_data: Dict) -> Dict:
-        async with get_db_connection() as conn:
-            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
-            
-            if not user:
-                await conn.execute("""
-                    INSERT INTO users (telegram_id, username, first_name, last_name, photo_url, language)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
-                    user_data['last_name'], user_data['photo_url'], user_data.get('language', 'ru'))
-                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
-            else:
-                await conn.execute("""
-                    UPDATE users SET username = $2, first_name = $3, last_name = $4, photo_url = $5
-                    WHERE telegram_id = $1
-                """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
-                    user_data['last_name'], user_data['photo_url'])
-            
-            published_count = await conn.fetchval("""
-                SELECT COUNT(*) FROM posts 
-                WHERE telegram_id = $1 AND status = 'approved'
-            """, user_data['telegram_id'])
-            
-            user_dict = dict(user)
-            user_dict['published_posts'] = published_count
-            user_cache[user_data['telegram_id']] = user_dict
-            
-            return {
-                'telegram_id': user_dict['telegram_id'],
-                'limits': {
-                    'used': published_count,
-                    'total': user_dict.get('post_limit', config.DAILY_POST_LIMIT)
-                },
-                'is_banned': user_dict.get('is_banned', False),
-                'language': user_dict.get('language', 'ru'),
-                'favorites': user_dict.get('favorites', []),
-                'hidden': user_dict.get('hidden', []),
-                'liked': user_dict.get('liked', []),
-                'notification_settings': user_dict.get('notification_settings', {
-                    'likes': True, 'system': True, 'account': True, 
-                    'new_posts': False, 'new_posts_categories': [], 'new_posts_tags': []
-                })
-            }
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with get_db_connection() as conn:
+                    user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
+                    
+                    if not user:
+                        await conn.execute("""
+                            INSERT INTO users (telegram_id, username, first_name, last_name, photo_url, language)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                        """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
+                            user_data['last_name'], user_data['photo_url'], user_data.get('language', 'ru'))
+                        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
+                    else:
+                        await conn.execute("""
+                            UPDATE users SET username = $2, first_name = $3, last_name = $4, photo_url = $5
+                            WHERE telegram_id = $1
+                        """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
+                            user_data['last_name'], user_data['photo_url'])
+                    
+                    published_count = await conn.fetchval("""
+                        SELECT COUNT(*) FROM posts 
+                        WHERE telegram_id = $1 AND status = 'approved'
+                    """, user_data['telegram_id'])
+                    
+                    user_dict = dict(user)
+                    user_dict['published_posts'] = published_count
+                    user_cache[user_data['telegram_id']] = user_dict
+                    
+                    return {
+                        'telegram_id': user_dict['telegram_id'],
+                        'limits': {
+                            'used': published_count,
+                            'total': user_dict.get('post_limit', config.DAILY_POST_LIMIT)
+                        },
+                        'is_banned': user_dict.get('is_banned', False),
+                        'language': user_dict.get('language', 'ru'),
+                        'favorites': user_dict.get('favorites', []),
+                        'hidden': user_dict.get('hidden', []),
+                        'liked': user_dict.get('liked', []),
+                        'notification_settings': user_dict.get('notification_settings', {
+                            'likes': True, 'system': True, 'account': True, 
+                            'new_posts': False, 'new_posts_categories': [], 'new_posts_tags': []
+                        })
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Error in sync_user attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    # Return fallback data if all attempts fail
+                    logger.warning(f"Using fallback data for user {user_data['telegram_id']}")
+                    return {
+                        'telegram_id': user_data['telegram_id'],
+                        'limits': {'used': 0, 'total': config.DAILY_POST_LIMIT},
+                        'is_banned': False,
+                        'language': user_data.get('language', 'ru'),
+                        'favorites': [],
+                        'hidden': [],
+                        'liked': [],
+                        'notification_settings': {
+                            'likes': True, 'system': True, 'account': True, 
+                            'new_posts': False, 'new_posts_categories': [], 'new_posts_tags': []
+                        }
+                    }
+                await asyncio.sleep(1)
 
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
@@ -225,66 +313,76 @@ class DatabaseService:
 
     @staticmethod
     async def get_posts(filters: Dict, page: int, limit: int, search: str = '', telegram_id: int = None) -> List[Dict]:
-        async with get_db_connection() as conn:
-            if telegram_id:
-                query = """
-                    SELECT p.*, 
-                        (CASE WHEN p.id = ANY(COALESCE(u.liked, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_liked,
-                        (CASE WHEN p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_favorited,
-                        (CASE WHEN p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_hidden
-                    FROM posts p
-                    LEFT JOIN users u ON u.telegram_id = $1
-                    WHERE p.status = 'approved'
-                """
-                params = [telegram_id]
-            else:
-                query = """
-                    SELECT p.*, FALSE as user_liked, FALSE as user_favorited, FALSE as user_hidden
-                    FROM posts p
-                    WHERE p.status = 'approved'
-                """
-                params = []
-            
-            if filters.get('filters', {}).get('sort') != 'hidden' and telegram_id:
-                query += " AND (p.id <> ALL(COALESCE(u.hidden, ARRAY[]::BIGINT[])))"
-            
-            if filters.get('category'):
-                params.append(filters['category'])
-                query += f" AND p.category = ${len(params)}"
-            
-            if search:
-                params.append(f"%{search}%")
-                query += f" AND LOWER(p.description) LIKE LOWER(${len(params)})"
-            
-            if filters.get('filters'):
-                for filter_type, values in filters['filters'].items():
-                    if values and filter_type != 'sort' and isinstance(values, list):
-                        for value in values:
-                            params.append(json.dumps([f"{filter_type}:{value}"]))
-                            query += f" AND p.tags @> ${len(params)}::JSONB"
-            
-            if filters.get('filters', {}).get('sort'):
-                sort_type = filters['filters']['sort']
-                if sort_type == 'my' and telegram_id:
-                    params.append(telegram_id)
-                    query += f" AND p.telegram_id = ${len(params)}"
-                elif sort_type == 'favorites' and telegram_id:
-                    query += " AND p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[]))"
-                elif sort_type == 'hidden' and telegram_id:
-                    query += " AND p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[]))"
-            
-            sort_type = filters.get('filters', {}).get('sort', 'new')
-            if sort_type == 'old':
-                query += " ORDER BY p.created_at ASC"
-            elif sort_type == 'rating':
-                query += " ORDER BY p.likes DESC, p.created_at DESC"
-            else:
-                query += " ORDER BY p.created_at DESC"
-            
-            query += f" LIMIT {limit} OFFSET {(page - 1) * limit}"
-            
-            posts = await conn.fetch(query, *params)
-            return [dict(post) for post in posts]
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with get_db_connection() as conn:
+                    if telegram_id:
+                        query = """
+                            SELECT p.*, 
+                                (CASE WHEN p.id = ANY(COALESCE(u.liked, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_liked,
+                                (CASE WHEN p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_favorited,
+                                (CASE WHEN p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_hidden
+                            FROM posts p
+                            LEFT JOIN users u ON u.telegram_id = $1
+                            WHERE p.status = 'approved'
+                        """
+                        params = [telegram_id]
+                    else:
+                        query = """
+                            SELECT p.*, FALSE as user_liked, FALSE as user_favorited, FALSE as user_hidden
+                            FROM posts p
+                            WHERE p.status = 'approved'
+                        """
+                        params = []
+                    
+                    if filters.get('filters', {}).get('sort') != 'hidden' and telegram_id:
+                        query += " AND (p.id <> ALL(COALESCE(u.hidden, ARRAY[]::BIGINT[])))"
+                    
+                    if filters.get('category'):
+                        params.append(filters['category'])
+                        query += f" AND p.category = ${len(params)}"
+                    
+                    if search:
+                        params.append(f"%{search}%")
+                        query += f" AND LOWER(p.description) LIKE LOWER(${len(params)})"
+                    
+                    if filters.get('filters'):
+                        for filter_type, values in filters['filters'].items():
+                            if values and filter_type != 'sort' and isinstance(values, list):
+                                for value in values:
+                                    params.append(json.dumps([f"{filter_type}:{value}"]))
+                                    query += f" AND p.tags @> ${len(params)}::JSONB"
+                    
+                    if filters.get('filters', {}).get('sort'):
+                        sort_type = filters['filters']['sort']
+                        if sort_type == 'my' and telegram_id:
+                            params.append(telegram_id)
+                            query += f" AND p.telegram_id = ${len(params)}"
+                        elif sort_type == 'favorites' and telegram_id:
+                            query += " AND p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[]))"
+                        elif sort_type == 'hidden' and telegram_id:
+                            query += " AND p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[]))"
+                    
+                    sort_type = filters.get('filters', {}).get('sort', 'new')
+                    if sort_type == 'old':
+                        query += " ORDER BY p.created_at ASC"
+                    elif sort_type == 'rating':
+                        query += " ORDER BY p.likes DESC, p.created_at DESC"
+                    else:
+                        query += " ORDER BY p.created_at DESC"
+                    
+                    query += f" LIMIT {limit} OFFSET {(page - 1) * limit}"
+                    
+                    posts = await conn.fetch(query, *params)
+                    return [dict(post) for post in posts]
+                    
+            except Exception as e:
+                logger.error(f"Error in get_posts attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    logger.warning("Returning empty posts list due to database error")
+                    return []
+                await asyncio.sleep(1)
 
     @staticmethod
     async def delete_post(post_id: int, telegram_id: int = None) -> bool:
@@ -979,7 +1077,13 @@ async def handle_websocket_message(ws, data: Dict):
         }, default=str))
         return
     
-    is_banned = await DatabaseService.is_user_banned(telegram_id)
+    # Проверяем бан только для определенных действий
+    try:
+        is_banned = await DatabaseService.is_user_banned(telegram_id)
+    except Exception as e:
+        logger.error(f"Error checking user ban status: {e}")
+        is_banned = False  # Fallback to not banned
+    
     banned_actions = ['create_post', 'like_post', 'report_post']
     
     if is_banned and action in banned_actions:
@@ -1000,90 +1104,195 @@ async def handle_websocket_message(ws, data: Dict):
                 'language': data.get('language', 'ru')
             }
             
-            user_data_result = await DatabaseService.sync_user(user_data)
-            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
-            await ws.send_str(json.dumps({
-                'type': 'user_synced',
-                'telegram_id': user_data_result['telegram_id'],
-                'limits': {
-                    'used': published_count,
-                    'total': user_data_result.get('post_limit', config.DAILY_POST_LIMIT)
-                },
-                'is_banned': user_data_result.get('is_banned', False),
-                'language': user_data_result.get('language', 'ru'),
-                'favorites': user_data_result.get('favorites', []),
-                'hidden': user_data_result.get('hidden', []),
-                'liked': user_data_result.get('liked', []),
-                'notification_settings': user_data_result.get('notification_settings', {})
-            }, default=str))
+            try:
+                user_data_result = await DatabaseService.sync_user(user_data)
+                published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+                await ws.send_str(json.dumps({
+                    'type': 'user_synced',
+                    'telegram_id': user_data_result['telegram_id'],
+                    'limits': {
+                        'used': published_count,
+                        'total': user_data_result.get('post_limit', config.DAILY_POST_LIMIT)
+                    },
+                    'is_banned': user_data_result.get('is_banned', False),
+                    'language': user_data_result.get('language', 'ru'),
+                    'favorites': user_data_result.get('favorites', []),
+                    'hidden': user_data_result.get('hidden', []),
+                    'liked': user_data_result.get('liked', []),
+                    'notification_settings': user_data_result.get('notification_settings', {})
+                }, default=str))
+            except Exception as db_error:
+                logger.error(f"Database error in sync_user: {db_error}")
+                # Send fallback response
+                await ws.send_str(json.dumps({
+                    'type': 'user_synced',
+                    'telegram_id': telegram_id,
+                    'limits': {'used': 0, 'total': config.DAILY_POST_LIMIT},
+                    'is_banned': False,
+                    'language': user_data['language'],
+                    'favorites': [],
+                    'hidden': [],
+                    'liked': [],
+                    'notification_settings': {'likes': True, 'system': True, 'account': True, 'new_posts': False, 'new_posts_categories': [], 'new_posts_tags': []}
+                }, default=str))
         
         elif action == 'create_post':
-            if not await PostLimitService.check_user_limit(telegram_id):
-                await ws.send_str(json.dumps({
-                    'type': 'limit_exceeded',
-                    'message': f'Достигнут лимит объявлений'
-                }, default=str))
-                return
-            
-            post = await DatabaseService.create_post({
-                'telegram_id': telegram_id,
-                'description': data['description'],
-                'category': data['category'],
-                'tags': data['tags'],
-                'creator': data['creator_data'],
-                'is_edit': data.get('is_edit', False),
-                'original_post_id': data.get('original_post_id')
-            })
-            
-            # Отправляем в модерацию
-            if telegram_bot:
-                moderation_bot = ModerationBot()
-                await moderation_bot.send_for_moderation(post)
-            
-            # Обновляем лимиты
-            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
-            limit = await DatabaseService.get_user_limit(telegram_id)
-            
-            await ws.send_str(json.dumps({
-                'type': 'post_created',
-                'message': 'Объявление опубликовано'
-            }, default=str))
-            
-            # Отправляем обновление лимитов
-            await ws.send_str(json.dumps({
-                'type': 'user_limits_updated',
-                'telegram_id': telegram_id,
-                'limits': {
-                    'used': published_count,
-                    'total': limit
-                }
-            }, default=str))
-            
-            # Отправляем пост в ленту
-            await broadcast_message({'type': 'post_approved', 'post': post})
-        
-        elif action == 'get_posts':
-            posts = await DatabaseService.get_posts(
-                data, data['page'], data['limit'], data.get('search', ''), telegram_id
-            )
-            await ws.send_str(json.dumps({
-                'type': 'posts',
-                'posts': posts,
-                'append': data.get('append', False)
-            }, default=str))
-        
-        elif action == 'like_post':
-            post = await DatabaseService.like_post(data['post_id'], telegram_id)
-            if post:
-                await broadcast_message({'type': 'post_updated', 'post': post, 'action_user_id': telegram_id})
-        
-        elif action == 'delete_post':
-            success = await DatabaseService.delete_post(data['post_id'], telegram_id)
-            if success:
+            try:
+                if not await PostLimitService.check_user_limit(telegram_id):
+                    await ws.send_str(json.dumps({
+                        'type': 'limit_exceeded',
+                        'message': f'Достигнут лимит объявлений'
+                    }, default=str))
+                    return
+                
+                post = await DatabaseService.create_post({
+                    'telegram_id': telegram_id,
+                    'description': data['description'],
+                    'category': data['category'],
+                    'tags': data['tags'],
+                    'creator': data['creator_data'],
+                    'is_edit': data.get('is_edit', False),
+                    'original_post_id': data.get('original_post_id')
+                })
+                
+                # Отправляем в модерацию
+                if telegram_bot:
+                    moderation_bot = ModerationBot()
+                    await moderation_bot.send_for_moderation(post)
+                
+                # Обновляем лимиты
                 published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
                 limit = await DatabaseService.get_user_limit(telegram_id)
                 
-                await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
+                await ws.send_str(json.dumps({
+                    'type': 'post_created',
+                    'message': 'Объявление опубликовано'
+                }, default=str))
+                
+                # Отправляем обновление лимитов
+                await ws.send_str(json.dumps({
+                    'type': 'user_limits_updated',
+                    'telegram_id': telegram_id,
+                    'limits': {
+                        'used': published_count,
+                        'total': limit
+                    }
+                }, default=str))
+                
+                # Отправляем пост в ленту
+                await broadcast_message({'type': 'post_approved', 'post': post})
+                
+            except Exception as post_error:
+                logger.error(f"Error creating post: {post_error}")
+                await ws.send_str(json.dumps({
+                    'type': 'error',
+                    'message': 'Ошибка при создании объявления'
+                }, default=str))
+        
+        elif action == 'get_posts':
+            try:
+                posts = await DatabaseService.get_posts(
+                    data, data['page'], data['limit'], data.get('search', ''), telegram_id
+                )
+                await ws.send_str(json.dumps({
+                    'type': 'posts',
+                    'posts': posts,
+                    'append': data.get('append', False)
+                }, default=str))
+            except Exception as posts_error:
+                logger.error(f"Error getting posts: {posts_error}")
+                await ws.send_str(json.dumps({
+                    'type': 'posts',
+                    'posts': [],
+                    'append': data.get('append', False)
+                }, default=str))
+        
+        elif action == 'like_post':
+            try:
+                post = await DatabaseService.like_post(data['post_id'], telegram_id)
+                if post:
+                    await broadcast_message({'type': 'post_updated', 'post': post, 'action_user_id': telegram_id})
+            except Exception as like_error:
+                logger.error(f"Error liking post: {like_error}")
+        
+        elif action == 'delete_post':
+            try:
+                success = await DatabaseService.delete_post(data['post_id'], telegram_id)
+                if success:
+                    published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+                    limit = await DatabaseService.get_user_limit(telegram_id)
+                    
+                    await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
+                    
+                    await ws.send_str(json.dumps({
+                        'type': 'user_limits_updated',
+                        'telegram_id': telegram_id,
+                        'limits': {
+                            'used': published_count,
+                            'total': limit
+                        }
+                    }, default=str))
+            except Exception as delete_error:
+                logger.error(f"Error deleting post: {delete_error}")
+        
+        elif action == 'get_post_for_edit':
+            try:
+                post = await DatabaseService.get_post_by_id(data['post_id'])
+                if post and post['telegram_id'] == telegram_id:
+                    await ws.send_str(json.dumps({
+                        'type': 'post_for_edit',
+                        'post': post
+                    }, default=str))
+                else:
+                    await ws.send_str(json.dumps({
+                        'type': 'error',
+                        'message': 'Пост не найден или не принадлежит вам'
+                    }, default=str))
+            except Exception as edit_error:
+                logger.error(f"Error getting post for edit: {edit_error}")
+                await ws.send_str(json.dumps({
+                    'type': 'error',
+                    'message': 'Ошибка при получении поста'
+                }, default=str))
+        
+        elif action == 'report_post':
+            try:
+                post = await DatabaseService.get_post_by_id(data['post_id'])
+                if post:
+                    result = await DatabaseService.report_post(
+                        data['post_id'], 
+                        telegram_id, 
+                        data.get('reason')
+                    )
+                    
+                    if result['success']:
+                        if result['message'] == 'already_reported':
+                            await ws.send_str(json.dumps({
+                                'type': 'error',
+                                'message': 'Вы уже отправляли жалобу на это объявление'
+                            }, default=str))
+                        else:
+                            if telegram_bot:
+                                moderation_bot = ModerationBot()
+                                reporter_data = {
+                                    'telegram_id': telegram_id,
+                                    'first_name': data.get('reporter_first_name', ''),
+                                    'last_name': data.get('reporter_last_name', ''),
+                                    'username': data.get('reporter_username', '')
+                                }
+                                await moderation_bot.send_report_for_moderation(post, reporter_data, data.get('reason'))
+                            
+                            await ws.send_str(json.dumps({
+                                'type': 'report_sent',
+                                'message': 'Жалоба отправлена модераторам'
+                            }, default=str))
+            except Exception as report_error:
+                logger.error(f"Error reporting post: {report_error}")
+        
+        elif action == 'get_user_limits':
+            try:
+                published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+                limit = await DatabaseService.get_user_limit(telegram_id)
                 
                 await ws.send_str(json.dumps({
                     'type': 'user_limits_updated',
@@ -1093,107 +1302,61 @@ async def handle_websocket_message(ws, data: Dict):
                         'total': limit
                     }
                 }, default=str))
-        
-        elif action == 'get_post_for_edit':
-            post = await DatabaseService.get_post_by_id(data['post_id'])
-            if post and post['telegram_id'] == telegram_id:
-                await ws.send_str(json.dumps({
-                    'type': 'post_for_edit',
-                    'post': post
-                }, default=str))
-            else:
-                await ws.send_str(json.dumps({
-                    'type': 'error',
-                    'message': 'Пост не найден или не принадлежит вам'
-                }, default=str))
-        
-        elif action == 'report_post':
-            post = await DatabaseService.get_post_by_id(data['post_id'])
-            if post:
-                result = await DatabaseService.report_post(
-                    data['post_id'], 
-                    telegram_id, 
-                    data.get('reason')
-                )
-                
-                if result['success']:
-                    if result['message'] == 'already_reported':
-                        await ws.send_str(json.dumps({
-                            'type': 'error',
-                            'message': 'Вы уже отправляли жалобу на это объявление'
-                        }, default=str))
-                    else:
-                        if telegram_bot:
-                            moderation_bot = ModerationBot()
-                            reporter_data = {
-                                'telegram_id': telegram_id,
-                                'first_name': data.get('reporter_first_name', ''),
-                                'last_name': data.get('reporter_last_name', ''),
-                                'username': data.get('reporter_username', '')
-                            }
-                            await moderation_bot.send_report_for_moderation(post, reporter_data, data.get('reason'))
-                        
-                        await ws.send_str(json.dumps({
-                            'type': 'report_sent',
-                            'message': 'Жалоба отправлена модераторам'
-                        }, default=str))
-        
-        elif action == 'get_user_limits':
-            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
-            limit = await DatabaseService.get_user_limit(telegram_id)
-            
-            await ws.send_str(json.dumps({
-                'type': 'user_limits_updated',
-                'telegram_id': telegram_id,
-                'limits': {
-                    'used': published_count,
-                    'total': limit
-                }
-            }, default=str))
+            except Exception as limits_error:
+                logger.error(f"Error getting user limits: {limits_error}")
         
         elif action == 'add_to_favorites':
-            result = await DatabaseService.add_to_favorites(data['post_id'], telegram_id)
-            await ws.send_str(json.dumps({
-                'type': 'favorites_updated',
-                'action': result['action'],
-                'message': result['message']
-            }, default=str))
-            if result['success']:
-                await asyncio.sleep(0.1)
-                posts = await DatabaseService.get_posts(
-                    {'filters': {'sort': 'new'}}, 1, 20, '', telegram_id
-                )
+            try:
+                result = await DatabaseService.add_to_favorites(data['post_id'], telegram_id)
                 await ws.send_str(json.dumps({
-                    'type': 'posts',
-                    'posts': posts,
-                    'append': False
+                    'type': 'favorites_updated',
+                    'action': result['action'],
+                    'message': result['message']
                 }, default=str))
+                if result['success']:
+                    await asyncio.sleep(0.1)
+                    posts = await DatabaseService.get_posts(
+                        {'filters': {'sort': 'new'}}, 1, 20, '', telegram_id
+                    )
+                    await ws.send_str(json.dumps({
+                        'type': 'posts',
+                        'posts': posts,
+                        'append': False
+                    }, default=str))
+            except Exception as fav_error:
+                logger.error(f"Error updating favorites: {fav_error}")
 
         elif action == 'hide_post':
-            result = await DatabaseService.hide_post(data['post_id'], telegram_id)
-            await ws.send_str(json.dumps({
-                'type': 'hide_updated',
-                'action': result['action'],
-                'message': result['message']
-            }, default=str))
-            if result['success']:
-                await asyncio.sleep(0.1)
-                posts = await DatabaseService.get_posts(
-                    {'filters': {'sort': 'new'}}, 1, 20, '', telegram_id
-                )
+            try:
+                result = await DatabaseService.hide_post(data['post_id'], telegram_id)
                 await ws.send_str(json.dumps({
-                    'type': 'posts',
-                    'posts': posts,
-                    'append': False
+                    'type': 'hide_updated',
+                    'action': result['action'],
+                    'message': result['message']
                 }, default=str))
+                if result['success']:
+                    await asyncio.sleep(0.1)
+                    posts = await DatabaseService.get_posts(
+                        {'filters': {'sort': 'new'}}, 1, 20, '', telegram_id
+                    )
+                    await ws.send_str(json.dumps({
+                        'type': 'posts',
+                        'posts': posts,
+                        'append': False
+                    }, default=str))
+            except Exception as hide_error:
+                logger.error(f"Error hiding post: {hide_error}")
         
         elif action == 'update_notification_settings':
-            settings = data.get('settings', {})
-            await DatabaseService.update_notification_settings(telegram_id, settings)
-            await ws.send_str(json.dumps({
-                'type': 'notification_settings_updated',
-                'message': 'Настройки уведомлений обновлены'
-            }, default=str))
+            try:
+                settings = data.get('settings', {})
+                await DatabaseService.update_notification_settings(telegram_id, settings)
+                await ws.send_str(json.dumps({
+                    'type': 'notification_settings_updated',
+                    'message': 'Настройки уведомлений обновлены'
+                }, default=str))
+            except Exception as notif_error:
+                logger.error(f"Error updating notification settings: {notif_error}")
             
     except Exception as e:
         logger.error(f"Error handling websocket message: {e}")
@@ -1219,6 +1382,8 @@ async def create_app():
         await ws.prepare(request)
         
         connected_clients.add(ws)
+        client_id = id(ws)
+        logger.info(f"WebSocket client {client_id} connected. Total clients: {len(connected_clients)}")
         
         try:
             async for msg in ws:
@@ -1227,25 +1392,49 @@ async def create_app():
                         data = json.loads(msg.data)
                         await handle_websocket_message(ws, data)
                     except json.JSONDecodeError:
+                        logger.warning(f"Client {client_id} sent invalid JSON")
                         await ws.send_str(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
                     except Exception as e:
-                        logger.error(f"WebSocket message error: {e}")
-                        await ws.send_str(json.dumps({'type': 'error', 'message': str(e)}))
+                        logger.error(f"WebSocket message error for client {client_id}: {e}")
+                        await ws.send_str(json.dumps({'type': 'error', 'message': 'Server error'}))
                 elif msg.type == WSMsgType.ERROR:
-                    logger.error(f'WebSocket error: {ws.exception()}')
+                    logger.error(f'WebSocket error for client {client_id}: {ws.exception()}')
+                elif msg.type == WSMsgType.CLOSE:
+                    logger.info(f'WebSocket client {client_id} closed connection')
+                    break
         except Exception as e:
-            logger.error(f"WebSocket handler error: {e}")
+            logger.error(f"WebSocket handler error for client {client_id}: {e}")
         finally:
             connected_clients.discard(ws)
+            logger.info(f"WebSocket client {client_id} disconnected. Total clients: {len(connected_clients)}")
         
         return ws
     
     async def health_handler(request):
-        return web.json_response({
+        health_status = {
             'status': 'ok',
+            'timestamp': datetime.utcnow().isoformat(),
             'clients': len(connected_clients),
-            'bot_active': telegram_bot is not None
-        })
+            'bot_active': telegram_bot is not None,
+            'database': 'unknown'
+        }
+        
+        # Check database connection
+        try:
+            if db_pool:
+                async with get_db_connection() as conn:
+                    await conn.fetchval("SELECT 1")
+                health_status['database'] = 'connected'
+            else:
+                health_status['database'] = 'not_initialized'
+                health_status['status'] = 'degraded'
+        except Exception as e:
+            logger.error(f"Health check database error: {e}")
+            health_status['database'] = 'error'
+            health_status['status'] = 'degraded'
+        
+        status_code = 200 if health_status['status'] == 'ok' else 503
+        return web.json_response(health_status, status=status_code)
     
     async def info_handler(request):
         return web.json_response({
@@ -1271,11 +1460,31 @@ async def create_app():
     return app
 
 async def main():
-    await DatabaseService.init_database()
+    logger.info("Starting Telegram Web App Server...")
     
+    # Initialize database with retry logic
+    max_retries = 5
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Database initialization attempt {attempt + 1}/{max_retries}")
+            await DatabaseService.init_database()
+            logger.info("Database initialized successfully")
+            break
+        except Exception as e:
+            logger.error(f"Database initialization attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                logger.error("All database initialization attempts failed. Server cannot start.")
+                return
+            logger.info(f"Retrying database initialization in {retry_delay} seconds...")
+            await asyncio.sleep(retry_delay)
+    
+    # Initialize bot
     moderation_bot = ModerationBot()
     await moderation_bot.init_bot()
     
+    # Create web app
     app = await create_app()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1283,26 +1492,42 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', config.PORT)
     await site.start()
     
+    logger.info(f"Server started on port {config.PORT}")
+    
+    # Start bot polling if available
     if moderation_bot.app:
         try:
             await moderation_bot.app.updater.start_polling(
                 drop_pending_updates=True,
                 error_callback=lambda exc: logger.error(f"Bot polling error: {exc}")
             )
+            logger.info("Bot polling started successfully")
         except Exception as e:
             logger.error(f"Bot polling failed: {e}")
     
+    # Keep server running
     try:
         await asyncio.Future()
     except KeyboardInterrupt:
-        pass
+        logger.info("Received shutdown signal")
     finally:
+        logger.info("Shutting down server...")
         try:
             if moderation_bot.app:
                 await moderation_bot.app.stop()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error stopping bot: {e}")
         await runner.cleanup()
+        
+        # Close database pool
+        if db_pool:
+            try:
+                await db_pool.close()
+                logger.info("Database pool closed")
+            except Exception as e:
+                logger.error(f"Error closing database pool: {e}")
+        
+        logger.info("Server shutdown complete")
 
 if __name__ == '__main__':
     asyncio.run(main())
