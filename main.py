@@ -298,8 +298,7 @@ class DatabaseService:
                 async with get_db_connection() as conn:
                     if telegram_id:
                         query = """
-                            SELECT p.*, 
-                                (CASE WHEN p.id = ANY(COALESCE(u.liked, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_liked,
+                            SELECT p.*,                     
                                 (CASE WHEN p.id = ANY(COALESCE(u.favorites, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_favorited,
                                 (CASE WHEN p.id = ANY(COALESCE(u.hidden, ARRAY[]::BIGINT[])) THEN TRUE ELSE FALSE END) as user_hidden
                             FROM posts p
@@ -404,7 +403,6 @@ class DatabaseService:
             if post:
                 post_dict = dict(post)
                 post_dict['like_action'] = action
-                post_dict['user_liked'] = action == 'added'
                 return post_dict
             return None
 
@@ -708,6 +706,13 @@ class NotificationService:
                 for user_row in users:
                     user = dict(user_row)
                     settings = user['notification_settings']
+                    if isinstance(settings, str):
+                        try:
+                            settings = json.loads(settings)
+                        except:
+                            settings = {}
+                    elif settings is None:
+                        settings = {}
                     
                     categories = settings.get('new_posts_categories', [])
                     if categories and post['category'] not in categories:
@@ -1189,7 +1194,13 @@ async def handle_websocket_message(ws, data: Dict):
             try:
                 post = await DatabaseService.like_post(data['post_id'], telegram_id)
                 if post:
-                    await broadcast_message({'type': 'post_updated', 'post': post, 'action_user_id': telegram_id})
+                    await broadcast_message({
+                        'type': 'post_updated', 
+                        'post': {
+                            'id': post['id'],
+                            'likes': post['likes']
+                        }
+                    })
             except:
                 pass
         
