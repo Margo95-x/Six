@@ -195,7 +195,13 @@ class DatabaseService:
         description = post_data.get('description', '').strip()
         if len(description) < 10:
             raise ValueError("Описание поста слишком короткое (менее 10 символов)")
+        
+        # Проверка лимита постов
+        if not await PostLimitService.check_user_limit(post_data['telegram_id']):
+            raise ValueError("Достигнут лимит объявлений")
+        
         async with get_db_connection() as conn:
+            # Создаём пост сразу со статусом 'approved'
             post_id = await conn.fetchval("""
                 INSERT INTO posts (telegram_id, description, category, tags, creator, status, is_edit, original_post_id)
                 VALUES ($1, $2, $3, $4, $5, 'approved', $6, $7) RETURNING id
@@ -206,7 +212,19 @@ class DatabaseService:
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             post_dict = dict(post)
             
-            # Отправляем уведомление о публикации
+            # Обновляем счётчик опубликованных постов
+            published_count = await DatabaseService.get_user_published_posts_count(post_data['telegram_id'])
+            limit = await DatabaseService.get_user_limit(post_data['telegram_id'])
+            await broadcast_message({
+                'type': 'user_limits_updated',
+                'telegram_id': post_data['telegram_id'],
+                'limits': {
+                    'used': published_count,
+                    'total': limit
+                }
+            })
+            
+            # Отправляем уведомление о публикации всем клиентам
             await broadcast_message({
                 'type': 'post_approved',
                 'post': post_dict
