@@ -24,7 +24,7 @@ class Config:
     MODERATION_CHAT_ID: int = int(os.getenv("MODERATION_CHAT_ID", "0"))
     REPORTS_THREAD_ID: int = int(os.getenv("REPORTS_THREAD_ID", "126"))
     PORT: int = int(os.getenv("PORT", "10000"))
-    DAILY_POST_LIMIT: int = 60
+    DAILY_POST_LIMIT: int = 10
     DB_MIN_SIZE: int = 1
     DB_MAX_SIZE: int = 3
     DB_COMMAND_TIMEOUT: int = 30
