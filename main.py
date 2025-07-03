@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Web App Server
+Telegram Web App Server - Production Version
 """
 
 import asyncio
@@ -12,7 +12,7 @@ from typing import Optional, List, Dict
 import asyncpg
 from contextlib import asynccontextmanager
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, filters
 from aiohttp import web, WSMsgType
 import aiohttp_cors
 from dataclasses import dataclass
@@ -47,7 +47,6 @@ async def get_db_connection():
     for attempt in range(max_retries):
         try:
             if db_pool is None:
-                logger.error("Database pool is not initialized")
                 raise RuntimeError("Database pool is not initialized")
             
             connection = await db_pool.acquire()
@@ -57,7 +56,6 @@ async def get_db_connection():
         except (asyncpg.exceptions.ConnectionDoesNotExistError, 
                 asyncpg.exceptions.InterfaceError,
                 asyncpg.exceptions.PostgresConnectionError) as e:
-            logger.warning(f"Database connection attempt {attempt + 1} failed: {e}")
             
             if connection:
                 try:
@@ -67,14 +65,12 @@ async def get_db_connection():
                 connection = None
             
             if attempt == max_retries - 1:
-                logger.error("All database connection attempts failed")
                 raise
             
             await asyncio.sleep(retry_delay)
             retry_delay *= 2
             
         except Exception as e:
-            logger.error(f"Unexpected database error: {e}")
             if connection:
                 try:
                     await db_pool.release(connection, timeout=1)
@@ -86,29 +82,25 @@ async def get_db_connection():
             if connection:
                 try:
                     await db_pool.release(connection)
-                except Exception as e:
-                    logger.warning(f"Error releasing connection: {e}")
+                except:
+                    pass
 
 class DatabaseService:
     @staticmethod
     async def init_database():
         global db_pool
         if not config.DATABASE_URL:
-            logger.error("DATABASE_URL not set!")
             raise ValueError("DATABASE_URL not set")
         
         database_url = config.DATABASE_URL
         if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
         
-        # Retry logic for database connection
         max_retries = 5
         retry_delay = 2
         
         for attempt in range(max_retries):
             try:
-                logger.info(f"Attempting to connect to database (attempt {attempt + 1}/{max_retries})...")
-                
                 ssl_context = None
                 if 'localhost' not in database_url and 'sslmode' not in database_url:
                     import ssl
@@ -121,29 +113,22 @@ class DatabaseService:
                     min_size=1,
                     max_size=2,
                     command_timeout=60,
-                    server_settings={
-                        'jit': 'off'
-                    },
+                    server_settings={'jit': 'off'},
                     ssl=ssl_context,
                     connection_class=asyncpg.Connection
                 )
                 
-                # Test the connection
                 async with db_pool.acquire() as conn:
                     await conn.fetchval("SELECT 1")
                 
-                logger.info("Database pool created and tested successfully")
                 break
                 
             except Exception as e:
-                logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
                 if attempt == max_retries - 1:
-                    logger.error("All database connection attempts failed")
                     raise
                 
-                logger.info(f"Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                retry_delay *= 2
         
         async with get_db_connection() as conn:
             await conn.execute("""
@@ -211,10 +196,9 @@ class DatabaseService:
                 await conn.execute("UPDATE users SET posts = '{}' WHERE posts IS NULL")
                 await conn.execute("UPDATE users SET notification_settings = '{\"likes\": true, \"system\": true, \"account\": true, \"new_posts\": false, \"new_posts_categories\": [], \"new_posts_tags\": []}' WHERE notification_settings IS NULL")
                 
-                # Обновляем статус всех постов на approved (новая логика)
                 await conn.execute("UPDATE posts SET status = 'approved' WHERE status = 'pending'")
-            except Exception as e:
-                logger.warning(f"Migration warning: {e}")
+            except:
+                pass
             
             try:
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_telegram_id ON posts(telegram_id)")
@@ -222,8 +206,8 @@ class DatabaseService:
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)")
-            except Exception as e:
-                logger.error(f"Error creating indexes: {e}")
+            except:
+                pass
 
     @staticmethod
     async def sync_user(user_data: Dict) -> Dict:
@@ -274,10 +258,7 @@ class DatabaseService:
                     }
                     
             except Exception as e:
-                logger.error(f"Error in sync_user attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
-                    # Return fallback data if all attempts fail
-                    logger.warning(f"Using fallback data for user {user_data['telegram_id']}")
                     return {
                         'telegram_id': user_data['telegram_id'],
                         'limits': {'used': 0, 'total': config.DAILY_POST_LIMIT},
@@ -296,7 +277,6 @@ class DatabaseService:
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
         async with get_db_connection() as conn:
-            # Посты теперь сразу публикуются
             post_id = await conn.fetchval("""
                 INSERT INTO posts (telegram_id, description, category, tags, creator, status, is_edit, original_post_id)
                 VALUES ($1, $2, $3, $4, $5, 'approved', $6, $7) RETURNING id
@@ -306,7 +286,6 @@ class DatabaseService:
             
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             
-            # Отправляем уведомления пользователям с настроенными фильтрами
             await NotificationService.send_new_post_notifications(dict(post))
             
             return dict(post)
@@ -378,9 +357,7 @@ class DatabaseService:
                     return [dict(post) for post in posts]
                     
             except Exception as e:
-                logger.error(f"Error in get_posts attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
-                    logger.warning("Returning empty posts list due to database error")
                     return []
                 await asyncio.sleep(1)
 
@@ -419,7 +396,6 @@ class DatabaseService:
                 """, post_id)
                 action = 'added'
                 
-                # Отправляем уведомление автору поста о лайке
                 post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
                 if post and action == 'added':
                     await NotificationService.send_like_notification(dict(post), telegram_id)
@@ -532,7 +508,6 @@ class DatabaseService:
                 user_cache[telegram_id]['is_banned'] = True
                 user_cache[telegram_id]['ban_reason'] = reason
             
-            # Отправляем уведомление пользователю
             await NotificationService.send_account_notification(telegram_id, 'ban', reason)
             return True
 
@@ -551,7 +526,6 @@ class DatabaseService:
                 user_cache[telegram_id]['is_banned'] = True
                 user_cache[telegram_id]['ban_reason'] = reason
             
-            # Отправляем уведомление пользователю
             await NotificationService.send_account_notification(telegram_id, 'hard_ban', reason)
             return [dict(post)['id'] for post in user_posts]
 
@@ -565,7 +539,6 @@ class DatabaseService:
                 user_cache[telegram_id]['is_banned'] = False
                 user_cache[telegram_id]['ban_reason'] = None
             
-            # Отправляем уведомление пользователю
             await NotificationService.send_account_notification(telegram_id, 'unban')
             return True
 
@@ -580,7 +553,6 @@ class DatabaseService:
             
             published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
             
-            # Отправляем уведомление пользователю
             await NotificationService.send_account_notification(telegram_id, 'limit_change', f'Новый лимит: {limit}')
             
             await broadcast_message({
@@ -618,14 +590,24 @@ class NotificationService:
         
         try:
             creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
-            author_id = creator['telegram_id']
-            
-            # Проверяем настройки уведомлений автора
-            user_info = await DatabaseService.get_user_info(author_id)
-            if not user_info or not user_info.get('notification_settings', {}).get('likes', True):
+            author_id = creator.get('telegram_id')
+            if not author_id:
                 return
             
-            # Получаем информацию о том, кто поставил лайк
+            user_info = await DatabaseService.get_user_info(author_id)
+            if not user_info:
+                return
+                
+            notification_settings = user_info.get('notification_settings', {})
+            if isinstance(notification_settings, str):
+                try:
+                    notification_settings = json.loads(notification_settings)
+                except:
+                    notification_settings = {}
+            
+            if not notification_settings.get('likes', True):
+                return
+            
             liker_info = await DatabaseService.get_user_info(liker_id)
             if not liker_info:
                 return
@@ -653,9 +635,18 @@ class NotificationService:
             return
         
         try:
-            # Проверяем настройки уведомлений пользователя
             user_info = await DatabaseService.get_user_info(telegram_id)
-            if not user_info or not user_info.get('notification_settings', {}).get('account', True):
+            if not user_info:
+                return
+                
+            notification_settings = user_info.get('notification_settings', {})
+            if isinstance(notification_settings, str):
+                try:
+                    notification_settings = json.loads(notification_settings)
+                except:
+                    notification_settings = {}
+            
+            if not notification_settings.get('account', True):
                 return
             
             messages = {
@@ -680,9 +671,18 @@ class NotificationService:
             return
         
         try:
-            # Проверяем настройки уведомлений пользователя
             user_info = await DatabaseService.get_user_info(telegram_id)
-            if not user_info or not user_info.get('notification_settings', {}).get('system', True):
+            if not user_info:
+                return
+                
+            notification_settings = user_info.get('notification_settings', {})
+            if isinstance(notification_settings, str):
+                try:
+                    notification_settings = json.loads(notification_settings)
+                except:
+                    notification_settings = {}
+            
+            if not notification_settings.get('system', True):
                 return
             
             await telegram_bot.send_message(
@@ -699,7 +699,6 @@ class NotificationService:
         
         try:
             async with get_db_connection() as conn:
-                # Получаем пользователей с настроенными уведомлениями о новых постах
                 users = await conn.fetch("""
                     SELECT telegram_id, notification_settings 
                     FROM users 
@@ -710,19 +709,16 @@ class NotificationService:
                     user = dict(user_row)
                     settings = user['notification_settings']
                     
-                    # Проверяем категории
                     categories = settings.get('new_posts_categories', [])
                     if categories and post['category'] not in categories:
                         continue
                     
-                    # Проверяем теги
                     tags = settings.get('new_posts_tags', [])
                     if tags:
                         post_tags = json.loads(post.get('tags', '[]'))
                         if not any(tag in post_tags for tag in tags):
                             continue
                     
-                    # Отправляем уведомление
                     creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
                     text = (
                         f"🆕 Новое объявление в категории '{post['category']}'\n\n"
@@ -750,20 +746,21 @@ class ModerationBot:
 
     async def init_bot(self):
         if not config.BOT_TOKEN:
-            logger.warning("BOT_TOKEN not set, bot will not be available")
             return
         
         try:
             self.app = Application.builder().token(config.BOT_TOKEN).build()
             
-            # Команды доступны только в группе модерации
-            self.app.add_handler(CommandHandler("start", self.start_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
-            self.app.add_handler(CommandHandler("delete", self.delete_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
-            self.app.add_handler(CommandHandler("ban", self.ban_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
-            self.app.add_handler(CommandHandler("hardban", self.hardban_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
-            self.app.add_handler(CommandHandler("unban", self.unban_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
-            self.app.add_handler(CommandHandler("setlimit", self.setlimit_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
-            self.app.add_handler(CommandHandler("getlimit", self.getlimit_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            # Команды работают только в группе модерации
+            moderation_filter = filters.Chat(config.MODERATION_CHAT_ID)
+            
+            self.app.add_handler(CommandHandler("start", self.start_command, filters=moderation_filter))
+            self.app.add_handler(CommandHandler("delete", self.delete_command, filters=moderation_filter))
+            self.app.add_handler(CommandHandler("ban", self.ban_command, filters=moderation_filter))
+            self.app.add_handler(CommandHandler("hardban", self.hardban_command, filters=moderation_filter))
+            self.app.add_handler(CommandHandler("unban", self.unban_command, filters=moderation_filter))
+            self.app.add_handler(CommandHandler("setlimit", self.setlimit_command, filters=moderation_filter))
+            self.app.add_handler(CommandHandler("getlimit", self.getlimit_command, filters=moderation_filter))
             self.app.add_handler(CallbackQueryHandler(self.handle_moderation_callback))
             
             await self.app.initialize()
@@ -771,8 +768,8 @@ class ModerationBot:
             
             try:
                 await self.app.bot.delete_webhook(drop_pending_updates=True)
-            except Exception as e:
-                logger.warning(f"Could not clear webhook: {e}")
+            except:
+                pass
             
             global telegram_bot
             telegram_bot = self.app.bot
@@ -817,8 +814,8 @@ class ModerationBot:
                     await NotificationService.send_account_notification(
                         creator['telegram_id'], 'post_deleted', 'Нарушение правил'
                     )
-                except Exception as e:
-                    logger.error(f"Failed to notify user: {e}")
+                except:
+                    pass
                 
                 await update.message.reply_text(f"✅ Объявление {post_id} удалено")
             else:
@@ -827,7 +824,6 @@ class ModerationBot:
         except ValueError:
             await update.message.reply_text("❌ Неверный ID объявления")
         except Exception as e:
-            logger.error(f"Delete command error: {e}")
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -842,7 +838,6 @@ class ModerationBot:
         except ValueError:
             await update.message.reply_text("❌ Неверный Telegram ID")
         except Exception as e:
-            logger.error(f"Ban command error: {e}")
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def hardban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -868,7 +863,6 @@ class ModerationBot:
         except ValueError:
             await update.message.reply_text("❌ Неверный Telegram ID")
         except Exception as e:
-            logger.error(f"Hardban command error: {e}")
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -883,7 +877,6 @@ class ModerationBot:
         except ValueError:
             await update.message.reply_text("❌ Неверный Telegram ID")
         except Exception as e:
-            logger.error(f"Unban command error: {e}")
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def setlimit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -899,7 +892,6 @@ class ModerationBot:
         except ValueError:
             await update.message.reply_text("❌ Неверные параметры")
         except Exception as e:
-            logger.error(f"Setlimit command error: {e}")
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def getlimit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -924,7 +916,6 @@ class ModerationBot:
         except ValueError:
             await update.message.reply_text("❌ Неверный Telegram ID")
         except Exception as e:
-            logger.error(f"Getlimit command error: {e}")
             await update.message.reply_text("❌ Произошла ошибка")
 
     async def handle_moderation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -974,7 +965,6 @@ class ModerationBot:
                 await query.edit_message_text(new_text)
                 
         except Exception as e:
-            logger.error(f"Moderation callback error: {e}")
             await query.edit_message_text("❌ Произошла ошибка")
 
     async def send_for_moderation(self, post: Dict):
@@ -1040,7 +1030,6 @@ class ModerationBot:
                 ]
             ])
             
-            # Отправляем в отдельную тему для жалоб
             await telegram_bot.send_message(
                 chat_id=config.MODERATION_CHAT_ID,
                 message_thread_id=config.REPORTS_THREAD_ID,
@@ -1060,8 +1049,7 @@ async def broadcast_message(message: Dict, filter_data: Dict = None):
         for ws in connected_clients.copy():
             try:
                 await ws.send_str(message_str)
-            except Exception as e:
-                logger.error(f"Error broadcasting to client: {e}")
+            except:
                 disconnected_clients.add(ws)
         
         connected_clients -= disconnected_clients
@@ -1077,12 +1065,10 @@ async def handle_websocket_message(ws, data: Dict):
         }, default=str))
         return
     
-    # Проверяем бан только для определенных действий
     try:
         is_banned = await DatabaseService.is_user_banned(telegram_id)
-    except Exception as e:
-        logger.error(f"Error checking user ban status: {e}")
-        is_banned = False  # Fallback to not banned
+    except:
+        is_banned = False
     
     banned_actions = ['create_post', 'like_post', 'report_post']
     
@@ -1121,9 +1107,7 @@ async def handle_websocket_message(ws, data: Dict):
                     'liked': user_data_result.get('liked', []),
                     'notification_settings': user_data_result.get('notification_settings', {})
                 }, default=str))
-            except Exception as db_error:
-                logger.error(f"Database error in sync_user: {db_error}")
-                # Send fallback response
+            except:
                 await ws.send_str(json.dumps({
                     'type': 'user_synced',
                     'telegram_id': telegram_id,
@@ -1155,12 +1139,10 @@ async def handle_websocket_message(ws, data: Dict):
                     'original_post_id': data.get('original_post_id')
                 })
                 
-                # Отправляем в модерацию
                 if telegram_bot:
                     moderation_bot = ModerationBot()
                     await moderation_bot.send_for_moderation(post)
                 
-                # Обновляем лимиты
                 published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
                 limit = await DatabaseService.get_user_limit(telegram_id)
                 
@@ -1169,7 +1151,6 @@ async def handle_websocket_message(ws, data: Dict):
                     'message': 'Объявление опубликовано'
                 }, default=str))
                 
-                # Отправляем обновление лимитов
                 await ws.send_str(json.dumps({
                     'type': 'user_limits_updated',
                     'telegram_id': telegram_id,
@@ -1179,11 +1160,9 @@ async def handle_websocket_message(ws, data: Dict):
                     }
                 }, default=str))
                 
-                # Отправляем пост в ленту
                 await broadcast_message({'type': 'post_approved', 'post': post})
                 
-            except Exception as post_error:
-                logger.error(f"Error creating post: {post_error}")
+            except:
                 await ws.send_str(json.dumps({
                     'type': 'error',
                     'message': 'Ошибка при создании объявления'
@@ -1199,8 +1178,7 @@ async def handle_websocket_message(ws, data: Dict):
                     'posts': posts,
                     'append': data.get('append', False)
                 }, default=str))
-            except Exception as posts_error:
-                logger.error(f"Error getting posts: {posts_error}")
+            except:
                 await ws.send_str(json.dumps({
                     'type': 'posts',
                     'posts': [],
@@ -1212,8 +1190,8 @@ async def handle_websocket_message(ws, data: Dict):
                 post = await DatabaseService.like_post(data['post_id'], telegram_id)
                 if post:
                     await broadcast_message({'type': 'post_updated', 'post': post, 'action_user_id': telegram_id})
-            except Exception as like_error:
-                logger.error(f"Error liking post: {like_error}")
+            except:
+                pass
         
         elif action == 'delete_post':
             try:
@@ -1232,8 +1210,8 @@ async def handle_websocket_message(ws, data: Dict):
                             'total': limit
                         }
                     }, default=str))
-            except Exception as delete_error:
-                logger.error(f"Error deleting post: {delete_error}")
+            except:
+                pass
         
         elif action == 'get_post_for_edit':
             try:
@@ -1248,8 +1226,7 @@ async def handle_websocket_message(ws, data: Dict):
                         'type': 'error',
                         'message': 'Пост не найден или не принадлежит вам'
                     }, default=str))
-            except Exception as edit_error:
-                logger.error(f"Error getting post for edit: {edit_error}")
+            except:
                 await ws.send_str(json.dumps({
                     'type': 'error',
                     'message': 'Ошибка при получении поста'
@@ -1286,8 +1263,8 @@ async def handle_websocket_message(ws, data: Dict):
                                 'type': 'report_sent',
                                 'message': 'Жалоба отправлена модераторам'
                             }, default=str))
-            except Exception as report_error:
-                logger.error(f"Error reporting post: {report_error}")
+            except:
+                pass
         
         elif action == 'get_user_limits':
             try:
@@ -1302,8 +1279,8 @@ async def handle_websocket_message(ws, data: Dict):
                         'total': limit
                     }
                 }, default=str))
-            except Exception as limits_error:
-                logger.error(f"Error getting user limits: {limits_error}")
+            except:
+                pass
         
         elif action == 'add_to_favorites':
             try:
@@ -1323,8 +1300,8 @@ async def handle_websocket_message(ws, data: Dict):
                         'posts': posts,
                         'append': False
                     }, default=str))
-            except Exception as fav_error:
-                logger.error(f"Error updating favorites: {fav_error}")
+            except:
+                pass
 
         elif action == 'hide_post':
             try:
@@ -1344,8 +1321,8 @@ async def handle_websocket_message(ws, data: Dict):
                         'posts': posts,
                         'append': False
                     }, default=str))
-            except Exception as hide_error:
-                logger.error(f"Error hiding post: {hide_error}")
+            except:
+                pass
         
         elif action == 'update_notification_settings':
             try:
@@ -1355,11 +1332,10 @@ async def handle_websocket_message(ws, data: Dict):
                     'type': 'notification_settings_updated',
                     'message': 'Настройки уведомлений обновлены'
                 }, default=str))
-            except Exception as notif_error:
-                logger.error(f"Error updating notification settings: {notif_error}")
+            except:
+                pass
             
     except Exception as e:
-        logger.error(f"Error handling websocket message: {e}")
         await ws.send_str(json.dumps({
             'type': 'error',
             'message': 'Внутренняя ошибка сервера'
@@ -1382,8 +1358,6 @@ async def create_app():
         await ws.prepare(request)
         
         connected_clients.add(ws)
-        client_id = id(ws)
-        logger.info(f"WebSocket client {client_id} connected. Total clients: {len(connected_clients)}")
         
         try:
             async for msg in ws:
@@ -1392,21 +1366,17 @@ async def create_app():
                         data = json.loads(msg.data)
                         await handle_websocket_message(ws, data)
                     except json.JSONDecodeError:
-                        logger.warning(f"Client {client_id} sent invalid JSON")
                         await ws.send_str(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
                     except Exception as e:
-                        logger.error(f"WebSocket message error for client {client_id}: {e}")
                         await ws.send_str(json.dumps({'type': 'error', 'message': 'Server error'}))
                 elif msg.type == WSMsgType.ERROR:
-                    logger.error(f'WebSocket error for client {client_id}: {ws.exception()}')
-                elif msg.type == WSMsgType.CLOSE:
-                    logger.info(f'WebSocket client {client_id} closed connection')
                     break
-        except Exception as e:
-            logger.error(f"WebSocket handler error for client {client_id}: {e}")
+                elif msg.type == WSMsgType.CLOSE:
+                    break
+        except:
+            pass
         finally:
             connected_clients.discard(ws)
-            logger.info(f"WebSocket client {client_id} disconnected. Total clients: {len(connected_clients)}")
         
         return ws
     
@@ -1419,7 +1389,6 @@ async def create_app():
             'database': 'unknown'
         }
         
-        # Check database connection
         try:
             if db_pool:
                 async with get_db_connection() as conn:
@@ -1428,8 +1397,7 @@ async def create_app():
             else:
                 health_status['database'] = 'not_initialized'
                 health_status['status'] = 'degraded'
-        except Exception as e:
-            logger.error(f"Health check database error: {e}")
+        except:
             health_status['database'] = 'error'
             health_status['status'] = 'degraded'
         
@@ -1462,13 +1430,11 @@ async def create_app():
 async def main():
     logger.info("Starting Telegram Web App Server...")
     
-    # Initialize database with retry logic
     max_retries = 5
     retry_delay = 5
     
     for attempt in range(max_retries):
         try:
-            logger.info(f"Database initialization attempt {attempt + 1}/{max_retries}")
             await DatabaseService.init_database()
             logger.info("Database initialized successfully")
             break
@@ -1477,14 +1443,11 @@ async def main():
             if attempt == max_retries - 1:
                 logger.error("All database initialization attempts failed. Server cannot start.")
                 return
-            logger.info(f"Retrying database initialization in {retry_delay} seconds...")
             await asyncio.sleep(retry_delay)
     
-    # Initialize bot
     moderation_bot = ModerationBot()
     await moderation_bot.init_bot()
     
-    # Create web app
     app = await create_app()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1494,7 +1457,6 @@ async def main():
     
     logger.info(f"Server started on port {config.PORT}")
     
-    # Start bot polling if available
     if moderation_bot.app:
         try:
             await moderation_bot.app.updater.start_polling(
@@ -1505,7 +1467,6 @@ async def main():
         except Exception as e:
             logger.error(f"Bot polling failed: {e}")
     
-    # Keep server running
     try:
         await asyncio.Future()
     except KeyboardInterrupt:
@@ -1515,17 +1476,16 @@ async def main():
         try:
             if moderation_bot.app:
                 await moderation_bot.app.stop()
-        except Exception as e:
-            logger.error(f"Error stopping bot: {e}")
+        except:
+            pass
         await runner.cleanup()
         
-        # Close database pool
         if db_pool:
             try:
                 await db_pool.close()
                 logger.info("Database pool closed")
-            except Exception as e:
-                logger.error(f"Error closing database pool: {e}")
+            except:
+                pass
         
         logger.info("Server shutdown complete")
 
