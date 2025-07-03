@@ -22,6 +22,7 @@ class Config:
     DATABASE_URL: str = os.getenv("DATABASE_URL")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN")
     MODERATION_CHAT_ID: int = int(os.getenv("MODERATION_CHAT_ID", "0"))
+    REPORTS_THREAD_ID: int = int(os.getenv("REPORTS_THREAD_ID", "126"))
     PORT: int = int(os.getenv("PORT", "10000"))
     DAILY_POST_LIMIT: int = 60
     DB_MIN_SIZE: int = 1
@@ -91,7 +92,8 @@ class DatabaseService:
                     last_post_count_reset DATE DEFAULT CURRENT_DATE,
                     posts_today INTEGER DEFAULT 0,
                     language TEXT DEFAULT 'ru',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    notification_settings JSONB DEFAULT '{"likes": true, "system": true, "account": true, "new_posts": false, "new_posts_categories": [], "new_posts_tags": []}'
                 )
             """)
             
@@ -103,7 +105,7 @@ class DatabaseService:
                     category TEXT NOT NULL,
                     tags JSONB NOT NULL DEFAULT '[]',
                     likes INTEGER DEFAULT 0,
-                    status TEXT DEFAULT 'pending',
+                    status TEXT DEFAULT 'approved',
                     moderation_message_id INTEGER,
                     is_edit BOOLEAN DEFAULT FALSE,
                     original_post_id INTEGER,
@@ -125,6 +127,7 @@ class DatabaseService:
             
             try:
                 await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'")
+                await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_settings JSONB DEFAULT '{\"likes\": true, \"system\": true, \"account\": true, \"new_posts\": false, \"new_posts_categories\": [], \"new_posts_tags\": []}'")
                 await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS is_edit BOOLEAN DEFAULT FALSE")
                 await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS original_post_id INTEGER")
                 await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
@@ -134,6 +137,10 @@ class DatabaseService:
                 await conn.execute("UPDATE users SET favorites = '{}' WHERE favorites IS NULL")
                 await conn.execute("UPDATE users SET hidden = '{}' WHERE hidden IS NULL")
                 await conn.execute("UPDATE users SET posts = '{}' WHERE posts IS NULL")
+                await conn.execute("UPDATE users SET notification_settings = '{\"likes\": true, \"system\": true, \"account\": true, \"new_posts\": false, \"new_posts_categories\": [], \"new_posts_tags\": []}' WHERE notification_settings IS NULL")
+                
+                # Обновляем статус всех постов на approved (новая логика)
+                await conn.execute("UPDATE posts SET status = 'approved' WHERE status = 'pending'")
             except Exception as e:
                 logger.warning(f"Migration warning: {e}")
             
@@ -149,7 +156,6 @@ class DatabaseService:
     @staticmethod
     async def sync_user(user_data: Dict) -> Dict:
         async with get_db_connection() as conn:
-            # Убираем дневной сброс - лимиты теперь общие
             user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_data['telegram_id'])
             
             if not user:
@@ -166,7 +172,6 @@ class DatabaseService:
                 """, user_data['telegram_id'], user_data['username'], user_data['first_name'],
                     user_data['last_name'], user_data['photo_url'])
             
-            # Считаем опубликованные посты для лимита
             published_count = await conn.fetchval("""
                 SELECT COUNT(*) FROM posts 
                 WHERE telegram_id = $1 AND status = 'approved'
@@ -186,22 +191,29 @@ class DatabaseService:
                 'language': user_dict.get('language', 'ru'),
                 'favorites': user_dict.get('favorites', []),
                 'hidden': user_dict.get('hidden', []),
-                'liked': user_dict.get('liked', [])
+                'liked': user_dict.get('liked', []),
+                'notification_settings': user_dict.get('notification_settings', {
+                    'likes': True, 'system': True, 'account': True, 
+                    'new_posts': False, 'new_posts_categories': [], 'new_posts_tags': []
+                })
             }
 
     @staticmethod
     async def create_post(post_data: Dict) -> Dict:
         async with get_db_connection() as conn:
+            # Посты теперь сразу публикуются
             post_id = await conn.fetchval("""
                 INSERT INTO posts (telegram_id, description, category, tags, creator, status, is_edit, original_post_id)
-                VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7) RETURNING id
+                VALUES ($1, $2, $3, $4, $5, 'approved', $6, $7) RETURNING id
             """, post_data['telegram_id'], post_data['description'], post_data['category'],
                 json.dumps(post_data['tags']), json.dumps(post_data['creator']),
                 post_data.get('is_edit', False), post_data.get('original_post_id'))
             
-            # Убираем инкремент posts_today - теперь лимиты общие
-            
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
+            
+            # Отправляем уведомления пользователям с настроенными фильтрами
+            await NotificationService.send_new_post_notifications(dict(post))
+            
             return dict(post)
 
     @staticmethod
@@ -268,42 +280,6 @@ class DatabaseService:
             return [dict(post) for post in posts]
 
     @staticmethod
-    async def approve_post(post_id: int) -> Optional[Dict]:
-        async with get_db_connection() as conn:
-            post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
-            if not post:
-                return None
-            
-            if post['is_edit'] and post['original_post_id']:
-                await conn.execute("""
-                    UPDATE posts SET 
-                        description = $2,
-                        category = $3,
-                        tags = $4,
-                        updated_at = CURRENT_TIMESTAMP,
-                        status = 'approved'
-                    WHERE id = $1
-                """, post['original_post_id'], post['description'], post['category'], post['tags'])
-                
-                await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
-                
-                updated_post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post['original_post_id'])
-                return dict(updated_post) if updated_post else None
-            else:
-                await conn.execute("UPDATE posts SET status = 'approved' WHERE id = $1", post_id)
-                updated_post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
-                return dict(updated_post) if updated_post else None
-
-    @staticmethod
-    async def reject_post(post_id: int) -> Optional[Dict]:
-        async with get_db_connection() as conn:
-            post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
-            if not post:
-                return None
-            await conn.execute("UPDATE posts SET status = 'rejected' WHERE id = $1", post_id)
-            return dict(post)
-
-    @staticmethod
     async def delete_post(post_id: int, telegram_id: int = None) -> bool:
         async with get_db_connection() as conn:
             if telegram_id:
@@ -337,6 +313,11 @@ class DatabaseService:
                     UPDATE posts SET likes = likes + 1 WHERE id = $1 AND status = 'approved'
                 """, post_id)
                 action = 'added'
+                
+                # Отправляем уведомление автору поста о лайке
+                post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
+                if post and action == 'added':
+                    await NotificationService.send_like_notification(dict(post), telegram_id)
             
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             if post:
@@ -445,12 +426,14 @@ class DatabaseService:
             if telegram_id in user_cache:
                 user_cache[telegram_id]['is_banned'] = True
                 user_cache[telegram_id]['ban_reason'] = reason
+            
+            # Отправляем уведомление пользователю
+            await NotificationService.send_account_notification(telegram_id, 'ban', reason)
             return True
 
     @staticmethod
     async def hard_ban_user(telegram_id: int, reason: str = None) -> bool:
         async with get_db_connection() as conn:
-            # Получаем все посты пользователя перед удалением
             user_posts = await conn.fetch("SELECT id FROM posts WHERE telegram_id = $1", telegram_id)
             
             await conn.execute("""
@@ -463,7 +446,8 @@ class DatabaseService:
                 user_cache[telegram_id]['is_banned'] = True
                 user_cache[telegram_id]['ban_reason'] = reason
             
-            # Возвращаем ID удаленных постов для broadcast
+            # Отправляем уведомление пользователю
+            await NotificationService.send_account_notification(telegram_id, 'hard_ban', reason)
             return [dict(post)['id'] for post in user_posts]
 
     @staticmethod
@@ -475,6 +459,9 @@ class DatabaseService:
             if telegram_id in user_cache:
                 user_cache[telegram_id]['is_banned'] = False
                 user_cache[telegram_id]['ban_reason'] = None
+            
+            # Отправляем уведомление пользователю
+            await NotificationService.send_account_notification(telegram_id, 'unban')
             return True
 
     @staticmethod
@@ -486,8 +473,11 @@ class DatabaseService:
             if telegram_id in user_cache:
                 user_cache[telegram_id]['post_limit'] = limit
             
-            # Отправляем обновление лимитов пользователю в реальном времени
             published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+            
+            # Отправляем уведомление пользователю
+            await NotificationService.send_account_notification(telegram_id, 'limit_change', f'Новый лимит: {limit}')
+            
             await broadcast_message({
                 'type': 'user_limits_updated',
                 'telegram_id': telegram_id,
@@ -505,10 +495,146 @@ class DatabaseService:
             user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
             return dict(user) if user else None
 
+    @staticmethod
+    async def update_notification_settings(telegram_id: int, settings: Dict) -> bool:
+        async with get_db_connection() as conn:
+            await conn.execute("""
+                UPDATE users SET notification_settings = $2 WHERE telegram_id = $1
+            """, telegram_id, json.dumps(settings))
+            if telegram_id in user_cache:
+                user_cache[telegram_id]['notification_settings'] = settings
+            return True
+
+class NotificationService:
+    @staticmethod
+    async def send_like_notification(post: Dict, liker_id: int):
+        if not telegram_bot:
+            return
+        
+        try:
+            creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
+            author_id = creator['telegram_id']
+            
+            # Проверяем настройки уведомлений автора
+            user_info = await DatabaseService.get_user_info(author_id)
+            if not user_info or not user_info.get('notification_settings', {}).get('likes', True):
+                return
+            
+            # Получаем информацию о том, кто поставил лайк
+            liker_info = await DatabaseService.get_user_info(liker_id)
+            if not liker_info:
+                return
+            
+            liker_username = liker_info.get('username', '')
+            liker_name = f"{liker_info.get('first_name', '')} {liker_info.get('last_name', '')}".strip()
+            
+            username_text = f"@{liker_username}" if liker_username else liker_name
+            
+            text = (
+                f"❤️ {username_text} поставил лайк на ваше объявление #{post['id']}\n\n"
+                f"📄 Текст: {post['description'][:100]}{'...' if len(post['description']) > 100 else ''}"
+            )
+            
+            await telegram_bot.send_message(
+                chat_id=author_id,
+                text=text
+            )
+        except Exception as e:
+            logger.error(f"Failed to send like notification: {e}")
+
+    @staticmethod
+    async def send_account_notification(telegram_id: int, action: str, reason: str = None):
+        if not telegram_bot:
+            return
+        
+        try:
+            # Проверяем настройки уведомлений пользователя
+            user_info = await DatabaseService.get_user_info(telegram_id)
+            if not user_info or not user_info.get('notification_settings', {}).get('account', True):
+                return
+            
+            messages = {
+                'ban': f"🚫 Ваш аккаунт заблокирован{f'. Причина: {reason}' if reason else ''}",
+                'hard_ban': f"🚫 Ваш аккаунт заблокирован, все объявления удалены{f'. Причина: {reason}' if reason else ''}",
+                'unban': "✅ Ваш аккаунт разблокирован",
+                'limit_change': f"📊 {reason if reason else 'Лимит объявлений изменен'}",
+                'post_deleted': f"🗑 Ваше объявление удалено модератором{f'. Причина: {reason}' if reason else ''}"
+            }
+            
+            if action in messages:
+                await telegram_bot.send_message(
+                    chat_id=telegram_id,
+                    text=messages[action]
+                )
+        except Exception as e:
+            logger.error(f"Failed to send account notification: {e}")
+
+    @staticmethod
+    async def send_system_notification(telegram_id: int, message: str):
+        if not telegram_bot:
+            return
+        
+        try:
+            # Проверяем настройки уведомлений пользователя
+            user_info = await DatabaseService.get_user_info(telegram_id)
+            if not user_info or not user_info.get('notification_settings', {}).get('system', True):
+                return
+            
+            await telegram_bot.send_message(
+                chat_id=telegram_id,
+                text=f"📢 {message}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send system notification: {e}")
+
+    @staticmethod
+    async def send_new_post_notifications(post: Dict):
+        if not telegram_bot:
+            return
+        
+        try:
+            async with get_db_connection() as conn:
+                # Получаем пользователей с настроенными уведомлениями о новых постах
+                users = await conn.fetch("""
+                    SELECT telegram_id, notification_settings 
+                    FROM users 
+                    WHERE notification_settings->>'new_posts' = 'true'
+                """)
+                
+                for user_row in users:
+                    user = dict(user_row)
+                    settings = user['notification_settings']
+                    
+                    # Проверяем категории
+                    categories = settings.get('new_posts_categories', [])
+                    if categories and post['category'] not in categories:
+                        continue
+                    
+                    # Проверяем теги
+                    tags = settings.get('new_posts_tags', [])
+                    if tags:
+                        post_tags = json.loads(post.get('tags', '[]'))
+                        if not any(tag in post_tags for tag in tags):
+                            continue
+                    
+                    # Отправляем уведомление
+                    creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
+                    text = (
+                        f"🆕 Новое объявление в категории '{post['category']}'\n\n"
+                        f"📄 {post['description'][:150]}{'...' if len(post['description']) > 150 else ''}\n\n"
+                        f"👤 От: {creator.get('first_name', '')} {creator.get('last_name', '')}"
+                    )
+                    
+                    await telegram_bot.send_message(
+                        chat_id=user['telegram_id'],
+                        text=text
+                    )
+        except Exception as e:
+            logger.error(f"Failed to send new post notifications: {e}")
+
 class PostLimitService:
     @staticmethod
     async def check_user_limit(telegram_id: int) -> bool:
-        # Проверяем общее количество опубликованных постов, а не дневные
         published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
         limit = await DatabaseService.get_user_limit(telegram_id)
         return published_count < limit
@@ -525,13 +651,14 @@ class ModerationBot:
         try:
             self.app = Application.builder().token(config.BOT_TOKEN).build()
             
-            self.app.add_handler(CommandHandler("start", self.start_command))
-            self.app.add_handler(CommandHandler("delete", self.delete_command))
-            self.app.add_handler(CommandHandler("ban", self.ban_command))
-            self.app.add_handler(CommandHandler("hardban", self.hardban_command))
-            self.app.add_handler(CommandHandler("unban", self.unban_command))
-            self.app.add_handler(CommandHandler("setlimit", self.setlimit_command))
-            self.app.add_handler(CommandHandler("getlimit", self.getlimit_command))
+            # Команды доступны только в группе модерации
+            self.app.add_handler(CommandHandler("start", self.start_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            self.app.add_handler(CommandHandler("delete", self.delete_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            self.app.add_handler(CommandHandler("ban", self.ban_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            self.app.add_handler(CommandHandler("hardban", self.hardban_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            self.app.add_handler(CommandHandler("unban", self.unban_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            self.app.add_handler(CommandHandler("setlimit", self.setlimit_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
+            self.app.add_handler(CommandHandler("getlimit", self.getlimit_command, filters=lambda update: update.effective_chat.id == config.MODERATION_CHAT_ID))
             self.app.add_handler(CallbackQueryHandler(self.handle_moderation_callback))
             
             await self.app.initialize()
@@ -582,9 +709,8 @@ class ModerationBot:
                 
                 try:
                     creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
-                    await telegram_bot.send_message(
-                        chat_id=creator['telegram_id'],
-                        text="🗑 Ваше объявление было удалено модератором за нарушение правил"
+                    await NotificationService.send_account_notification(
+                        creator['telegram_id'], 'post_deleted', 'Нарушение правил'
                     )
                 except Exception as e:
                     logger.error(f"Failed to notify user: {e}")
@@ -623,7 +749,6 @@ class ModerationBot:
             telegram_id = int(context.args[0])
             deleted_post_ids = await DatabaseService.hard_ban_user(telegram_id, "Хард-бан модератором")
             
-            # Отправляем broadcast для каждого удаленного поста
             for post_id in deleted_post_ids:
                 await broadcast_message({
                     'type': 'post_deleted',
@@ -711,49 +836,9 @@ class ModerationBot:
             return
         
         try:
-            if action == "approve":
-                approved_post = await DatabaseService.approve_post(post_id)
-                if approved_post:
-                    # Добавляем информацию о том, было ли это редактирование
-                    approved_post['is_edit'] = post.get('is_edit', False)
-                    approved_post['original_post_id'] = post.get('original_post_id')
-                    
-                    await broadcast_message({
-                        'type': 'post_approved',
-                        'post': approved_post
-                    })
-                    
-                    creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
-                    await telegram_bot.send_message(
-                        chat_id=creator['telegram_id'],
-                        text="✅ Ваше объявление одобрено и опубликовано!"
-                    )
-                    
-                    new_text = query.message.text + f"\n\n✅ Объявление опубликовано\n🆔 ID объявления: {approved_post['id']}"
-                    if new_text != query.message.text:
-                        await query.edit_message_text(new_text)
-                    else:
-                        await query.answer("Действие выполнено")
-                else:
-                    await query.edit_message_text("❌ Ошибка при одобрении")
-                    
-            elif action == "reject":
-                await DatabaseService.reject_post(post_id)
-                
-                try:
-                    creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
-                    edit_text = "изменения отклонены" if post.get('is_edit') else "объявление отклонено"
-                    await telegram_bot.send_message(
-                        chat_id=creator['telegram_id'],
-                        text=f"❌ Ваше {edit_text} модератором за нарушение правил"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify user: {e}")
-                
-                new_text = query.message.text + f"\n\n❌ {'Изменения отклонены' if post.get('is_edit') else 'Объявление отклонено'}"
-                await query.edit_message_text(new_text)
-                
-            elif action == "delete":
+            creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
+            
+            if action == "delete":
                 success = await DatabaseService.delete_post(post_id)
                 if success:
                     await broadcast_message({
@@ -761,17 +846,26 @@ class ModerationBot:
                         'post_id': post_id
                     })
                     
-                    creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
-                    await telegram_bot.send_message(
-                        chat_id=creator['telegram_id'],
-                        text="🗑 Ваше объявление удалено модератором за нарушение правил"
+                    await NotificationService.send_account_notification(
+                        creator['telegram_id'], 'post_deleted', 'Нарушение правил'
                     )
                     
                     new_text = query.message.text + f"\n\n🗑 Объявление удалено"
                     await query.edit_message_text(new_text)
                     
-            elif action == "keep":
-                new_text = query.message.text + f"\n\n✅ Объявление проверено, все в порядке"
+            elif action == "ban":
+                await DatabaseService.ban_user(creator['telegram_id'], "Забанен модератором")
+                new_text = query.message.text + f"\n\n🚫 Пользователь забанен"
+                await query.edit_message_text(new_text)
+                
+            elif action == "hardban":
+                deleted_post_ids = await DatabaseService.hard_ban_user(creator['telegram_id'], "Хард-бан модератором")
+                for deleted_id in deleted_post_ids:
+                    await broadcast_message({
+                        'type': 'post_deleted',
+                        'post_id': deleted_id
+                    })
+                new_text = query.message.text + f"\n\n🚫 Пользователь забанен, все посты удалены"
                 await query.edit_message_text(new_text)
                 
         except Exception as e:
@@ -780,15 +874,13 @@ class ModerationBot:
 
     async def send_for_moderation(self, post: Dict):
         if not config.MODERATION_CHAT_ID:
-            return await DatabaseService.approve_post(post['id'])
+            return
         
         try:
             creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
             
-            edit_prefix = "🔄 ИЗМЕНЕНИЕ объявления" if post.get('is_edit') else "📝 Новое объявление"
-            
             text = (
-                f"{edit_prefix} #{post['id']}\n\n"
+                f"📝 Новое объявление #{post['id']}\n\n"
                 f"👤 От: {creator['first_name']} {creator.get('last_name', '')}\n"
                 f"🆔 ID: {creator['telegram_id']}\n"
                 f"👤 Username: @{creator.get('username', 'нет')}\n"
@@ -797,13 +889,11 @@ class ModerationBot:
                 f"🏷 Теги: {', '.join(json.loads(post['tags']) if post['tags'] else [])}"
             )
             
-            if post.get('is_edit'):
-                text += f"\n\n🔄 Оригинальный пост ID: {post.get('original_post_id')}"
-            
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Принять", callback_data=f"approve_{post['id']}"),
-                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{post['id']}")
+                    InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{post['id']}"),
+                    InlineKeyboardButton("🚫 Бан", callback_data=f"ban_{post['id']}"),
+                    InlineKeyboardButton("💥 Хард-бан", callback_data=f"hardban_{post['id']}")
                 ]
             ])
             
@@ -815,7 +905,6 @@ class ModerationBot:
             
         except Exception as e:
             logger.error(f"Failed to send moderation message: {e}")
-            return await DatabaseService.approve_post(post['id'])
 
     async def send_report_for_moderation(self, post: Dict, reporter_data: Dict, reason: str = None):
         if not config.MODERATION_CHAT_ID:
@@ -841,12 +930,15 @@ class ModerationBot:
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🗑 Удалить объявление", callback_data=f"delete_{post['id']}"),
-                    InlineKeyboardButton("✅ Оставить", callback_data=f"keep_{post['id']}")
+                    InlineKeyboardButton("🚫 Бан автора", callback_data=f"ban_{post['id']}"),
+                    InlineKeyboardButton("💥 Хард-бан", callback_data=f"hardban_{post['id']}")
                 ]
             ])
             
+            # Отправляем в отдельную тему для жалоб
             await telegram_bot.send_message(
                 chat_id=config.MODERATION_CHAT_ID,
+                message_thread_id=config.REPORTS_THREAD_ID,
                 text=text,
                 reply_markup=keyboard
             )
@@ -880,7 +972,6 @@ async def handle_websocket_message(ws, data: Dict):
         }, default=str))
         return
     
-    # Проверяем бан только для определенных действий
     is_banned = await DatabaseService.is_user_banned(telegram_id)
     banned_actions = ['create_post', 'like_post', 'report_post']
     
@@ -915,7 +1006,8 @@ async def handle_websocket_message(ws, data: Dict):
                 'language': user_data_result.get('language', 'ru'),
                 'favorites': user_data_result.get('favorites', []),
                 'hidden': user_data_result.get('hidden', []),
-                'liked': user_data_result.get('liked', [])
+                'liked': user_data_result.get('liked', []),
+                'notification_settings': user_data_result.get('notification_settings', {})
             }, default=str))
         
         elif action == 'create_post':
@@ -936,15 +1028,32 @@ async def handle_websocket_message(ws, data: Dict):
                 'original_post_id': data.get('original_post_id')
             })
             
+            # Отправляем в модерацию
             if telegram_bot:
                 moderation_bot = ModerationBot()
                 await moderation_bot.send_for_moderation(post)
             
-            # При создании НЕ обновляем лимиты, только отправляем подтверждение
+            # Обновляем лимиты
+            published_count = await DatabaseService.get_user_published_posts_count(telegram_id)
+            limit = await DatabaseService.get_user_limit(telegram_id)
+            
             await ws.send_str(json.dumps({
                 'type': 'post_created',
-                'message': 'Изменения отправлены на модерацию' if data.get('is_edit') else 'Объявление отправлено на модерацию'
+                'message': 'Объявление опубликовано'
             }, default=str))
+            
+            # Отправляем обновление лимитов
+            await ws.send_str(json.dumps({
+                'type': 'user_limits_updated',
+                'telegram_id': telegram_id,
+                'limits': {
+                    'used': published_count,
+                    'total': limit
+                }
+            }, default=str))
+            
+            # Отправляем пост в ленту
+            await broadcast_message({'type': 'post_approved', 'post': post})
         
         elif action == 'get_posts':
             posts = await DatabaseService.get_posts(
@@ -959,7 +1068,6 @@ async def handle_websocket_message(ws, data: Dict):
         elif action == 'like_post':
             post = await DatabaseService.like_post(data['post_id'], telegram_id)
             if post:
-                # Отправляем обновление всем пользователям
                 await broadcast_message({'type': 'post_updated', 'post': post, 'action_user_id': telegram_id})
         
         elif action == 'delete_post':
@@ -970,7 +1078,6 @@ async def handle_websocket_message(ws, data: Dict):
                 
                 await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
                 
-                # Отправляем обновление лимитов обратно пользователю
                 await ws.send_str(json.dumps({
                     'type': 'user_limits_updated',
                     'telegram_id': telegram_id,
@@ -1072,6 +1179,14 @@ async def handle_websocket_message(ws, data: Dict):
                     'posts': posts,
                     'append': False
                 }, default=str))
+        
+        elif action == 'update_notification_settings':
+            settings = data.get('settings', {})
+            await DatabaseService.update_notification_settings(telegram_id, settings)
+            await ws.send_str(json.dumps({
+                'type': 'notification_settings_updated',
+                'message': 'Настройки уведомлений обновлены'
+            }, default=str))
             
     except Exception as e:
         logger.error(f"Error handling websocket message: {e}")
