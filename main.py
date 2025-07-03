@@ -24,7 +24,7 @@ class Config:
     MODERATION_CHAT_ID: int = int(os.getenv("MODERATION_CHAT_ID", "0"))
     REPORTS_THREAD_ID: int = int(os.getenv("REPORTS_THREAD_ID", "126"))
     PORT: int = int(os.getenv("PORT", "10000"))
-    DAILY_POST_LIMIT: int = 60
+    DAILY_POST_LIMIT: int = 10
     DB_MIN_SIZE: int = 1
     DB_MAX_SIZE: int = 3
     DB_COMMAND_TIMEOUT: int = 30
@@ -160,7 +160,7 @@ class DatabaseService:
                     posts BIGINT[] DEFAULT '{}',
                     is_banned BOOLEAN DEFAULT FALSE,
                     ban_reason TEXT,
-                    post_limit INTEGER DEFAULT 60,
+                    post_limit INTEGER DEFAULT 10,
                     last_post_count_reset DATE DEFAULT CURRENT_DATE,
                     posts_today INTEGER DEFAULT 0,
                     language TEXT DEFAULT 'ru',
