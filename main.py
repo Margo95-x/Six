@@ -250,6 +250,56 @@ async def update_notification_settings(notif_data: NotificationSettings):
     )
     
     await conn.close()
+
+async def sync_user(user_data: UserSync) -> dict:
+    """Синхронизация пользователя с БД"""
+    conn = await asyncpg.connect(DATABASE_URL)
+    
+    # Проверяем существование пользователя
+    user = await conn.fetchrow(
+        "SELECT * FROM users WHERE telegram_id = $1", 
+        user_data.telegram_id
+    )
+    
+    if user:
+        # Обновляем данные если изменились
+        await conn.execute(
+            """UPDATE users SET username = $1, full_name = $2, updated_at = NOW() 
+               WHERE telegram_id = $3""",
+            user_data.username, user_data.full_name, user_data.telegram_id
+        )
+        user_info = dict(user)
+        # Конвертируем datetime в строки
+        if 'created_at' in user_info and user_info['created_at']:
+            user_info['created_at'] = user_info['created_at'].isoformat()
+        if 'updated_at' in user_info and user_info['updated_at']:
+            user_info['updated_at'] = user_info['updated_at'].isoformat()
+    else:
+        # Создаем нового пользователя
+        await conn.execute(
+            """INSERT INTO users (telegram_id, username, full_name) 
+               VALUES ($1, $2, $3)""",
+            user_data.telegram_id, user_data.username, user_data.full_name
+        )
+        user_info = {
+            "telegram_id": user_data.telegram_id,
+            "username": user_data.username,
+            "full_name": user_data.full_name,
+            "posts": [],
+            "hidden": [],
+            "favorites": [],
+            "likes": [],
+            "reports": [],
+            "post_limit": 10,
+            "status": "live",
+            "subscriptions": {},
+            "notifications_likes": True,
+            "notifications_system": True,
+            "notifications_filters": {}
+        }
+    
+    await conn.close()
+    return user_info
     """Синхронизация пользователя с БД"""
     conn = await asyncpg.connect(DATABASE_URL)
     
@@ -795,6 +845,12 @@ async def hardban_user(telegram_id: int, message):
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         
+        # Получаем автора для проверки настроек уведомлений
+        user = await conn.fetchrow(
+            "SELECT notifications_system FROM users WHERE telegram_id = $1",
+            telegram_id
+        )
+        
         # Получаем посты пользователя
         user_posts = await conn.fetch(
             "SELECT id FROM posts WHERE telegram_id = $1",
@@ -821,19 +877,36 @@ async def hardban_user(telegram_id: int, message):
                 post["id"]
             )
         
+        # Получаем обновленную информацию о пользователе
+        updated_user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+        
         await conn.close()
         
-        # Уведомляем пользователя
-        try:
-            await bot.send_message(telegram_id, "💀 Ваш аккаунт заблокирован и все объявления удалены")
-        except:
-            pass
+        # Уведомляем пользователя (проверяем настройки)
+        if user and user.get("notifications_system", True):
+            try:
+                await bot.send_message(telegram_id, "💀 Ваш аккаунт заблокирован и все объявления удалены")
+            except:
+                pass
         
-        # Обновляем фронт
+        # Обновляем фронт - удаляем посты
         for post in user_posts:
             await broadcast_message({
                 "type": "post_deleted",
                 "data": {"post_id": post["id"]}
+            })
+        
+        # Обновляем информацию о пользователе на фронте
+        if updated_user:
+            user_info = dict(updated_user)
+            if 'created_at' in user_info and user_info['created_at']:
+                user_info['created_at'] = user_info['created_at'].isoformat()
+            if 'updated_at' in user_info and user_info['updated_at']:
+                user_info['updated_at'] = user_info['updated_at'].isoformat()
+            
+            await broadcast_message({
+                "type": "user_status_updated",
+                "data": {"telegram_id": telegram_id, "user_info": user_info}
             })
         
         await message.answer(f"✅ Пользователь {telegram_id} получил хард бан")
