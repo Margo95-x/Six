@@ -378,7 +378,7 @@ async def create_post(post_data: PostCreate) -> dict:
         post_data.telegram_id, post_data.description, post_data.category,
         post_data.city, post_data.gender, post_data.age, post_data.date,
         user["username"], user["full_name"], 
-        user["avatar_url"] 
+        user.get("avatar_url", f"https://t.me/i/userpic/160/{user['username']}.jpg")
     )
     
     # Обновляем список постов пользователя
