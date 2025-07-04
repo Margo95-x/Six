@@ -14,6 +14,12 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 
+# Функция для сериализации datetime в JSON
+def serialize_datetime(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -192,6 +198,11 @@ async def sync_user(user_data: UserSync) -> dict:
             user_data.username, user_data.full_name, user_data.telegram_id
         )
         user_info = dict(user)
+        # Конвертируем datetime в строки
+        if 'created_at' in user_info and user_info['created_at']:
+            user_info['created_at'] = user_info['created_at'].isoformat()
+        if 'updated_at' in user_info and user_info['updated_at']:
+            user_info['updated_at'] = user_info['updated_at'].isoformat()
     else:
         # Создаем нового пользователя
         await conn.execute(
@@ -255,10 +266,17 @@ async def create_post(post_data: PostCreate) -> dict:
     post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
     await conn.close()
     
-    # Отправляем в модерацию
-    await send_to_moderation(dict(post), "new")
+    # Конвертируем datetime в строки
+    post_dict = dict(post)
+    if 'created_at' in post_dict and post_dict['created_at']:
+        post_dict['created_at'] = post_dict['created_at'].isoformat()
+    if 'updated_at' in post_dict and post_dict['updated_at']:
+        post_dict['updated_at'] = post_dict['updated_at'].isoformat()
     
-    return dict(post)
+    # Отправляем в модерацию
+    await send_to_moderation(post_dict, "new")
+    
+    return post_dict
 
 async def update_post(post_data: PostUpdate) -> dict:
     """Обновление поста"""
@@ -297,10 +315,17 @@ async def update_post(post_data: PostUpdate) -> dict:
     updated_post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_data.post_id)
     await conn.close()
     
-    # Отправляем в модерацию
-    await send_to_moderation(dict(updated_post), "updated")
+    # Конвертируем datetime в строки
+    post_dict = dict(updated_post)
+    if 'created_at' in post_dict and post_dict['created_at']:
+        post_dict['created_at'] = post_dict['created_at'].isoformat()
+    if 'updated_at' in post_dict and post_dict['updated_at']:
+        post_dict['updated_at'] = post_dict['updated_at'].isoformat()
     
-    return dict(updated_post)
+    # Отправляем в модерацию
+    await send_to_moderation(post_dict, "updated")
+    
+    return post_dict
 
 async def handle_user_action(action_data: UserAction) -> dict:
     """Обработка действий пользователя"""
@@ -376,19 +401,32 @@ async def handle_user_action(action_data: UserAction) -> dict:
             
             # Отправляем в модерацию
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", action_data.post_id)
-            await send_report_to_moderation(dict(post))
+            post_dict = dict(post)
+            if 'created_at' in post_dict and post_dict['created_at']:
+                post_dict['created_at'] = post_dict['created_at'].isoformat()
+            if 'updated_at' in post_dict and post_dict['updated_at']:
+                post_dict['updated_at'] = post_dict['updated_at'].isoformat()
+            await send_report_to_moderation(post_dict)
     
     # Получаем обновленный пост
     post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", action_data.post_id)
     await conn.close()
     
-    return dict(post)
+    # Конвертируем datetime в строки
+    post_dict = dict(post)
+    if 'created_at' in post_dict and post_dict['created_at']:
+        post_dict['created_at'] = post_dict['created_at'].isoformat()
+    if 'updated_at' in post_dict and post_dict['updated_at']:
+        post_dict['updated_at'] = post_dict['updated_at'].isoformat()
+    
+    return post_dict
 
 # Telegram бот функции
 async def send_to_moderation(post: dict, action_type: str):
     """Отправка поста в модерацию"""
     text = f"🆕 Новое объявление" if action_type == "new" else f"✏️ Обновлено объявление"
     text += f"\n\nID: {post['id']}\nАвтор: {post['full_name']} (@{post['username']})\n"
+    text += f"Telegram ID: {post['telegram_id']}\n"
     text += f"Описание: {post['description']}\nКатегория: {post['category']}\n"
     text += f"Теги: {post['city']}, {post['gender']}, {post['age']}, {post['date_tag']}"
     
@@ -405,6 +443,7 @@ async def send_to_moderation(post: dict, action_type: str):
 async def send_report_to_moderation(post: dict):
     """Отправка жалобы в модерацию"""
     text = f"⚠️ Жалоба на объявление\n\nID: {post['id']}\nАвтор: {post['full_name']} (@{post['username']})\n"
+    text += f"Telegram ID: {post['telegram_id']}\n"
     text += f"Описание: {post['description']}\nЖалоб: {post['reports_count']}"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -429,213 +468,270 @@ async def send_like_notification(telegram_id: int, post_id: int, liker_username:
 @dp.message(lambda message: message.chat.id == MODERATION_CHAT_ID and message.text.startswith('/'))
 async def handle_moderation_commands(message: types.Message):
     """Обработка команд модерации"""
-    command_parts = message.text.split()
-    command = command_parts[0]
-    
-    if command == "/delete" and len(command_parts) > 1:
-        post_id = int(command_parts[1])
-        await delete_post(post_id, message)
+    try:
+        command_parts = message.text.split()
+        command = command_parts[0]
         
-    elif command == "/ban" and len(command_parts) > 1:
-        telegram_id = int(command_parts[1])
-        await ban_user(telegram_id, message)
-        
-    elif command == "/hardban" and len(command_parts) > 1:
-        telegram_id = int(command_parts[1])
-        await hardban_user(telegram_id, message)
-        
-    elif command == "/unban" and len(command_parts) > 1:
-        telegram_id = int(command_parts[1])
-        await unban_user(telegram_id, message)
-        
-    elif command == "/setlimit" and len(command_parts) > 2:
-        telegram_id = int(command_parts[1])
-        limit = int(command_parts[2])
-        await set_user_limit(telegram_id, limit, message)
-        
-    elif command == "/getlimit" and len(command_parts) > 1:
-        telegram_id = int(command_parts[1])
-        await get_user_limit(telegram_id, message)
+        if command == "/delete" and len(command_parts) > 1:
+            post_id = int(command_parts[1])
+            await delete_post(post_id, message)
+            
+        elif command == "/ban" and len(command_parts) > 1:
+            telegram_id = int(command_parts[1])
+            await ban_user(telegram_id, message)
+            
+        elif command == "/hardban" and len(command_parts) > 1:
+            telegram_id = int(command_parts[1])
+            await hardban_user(telegram_id, message)
+            
+        elif command == "/unban" and len(command_parts) > 1:
+            telegram_id = int(command_parts[1])
+            await unban_user(telegram_id, message)
+            
+        elif command == "/setlimit" and len(command_parts) > 2:
+            telegram_id = int(command_parts[1])
+            limit = int(command_parts[2])
+            await set_user_limit(telegram_id, limit, message)
+            
+        elif command == "/getlimit" and len(command_parts) > 1:
+            telegram_id = int(command_parts[1])
+            await get_user_limit(telegram_id, message)
+            
+        else:
+            await message.answer("Доступные команды:\n/delete <post_id> - Удалить объявление\n/ban <telegram_id> - Забанить пользователя\n/hardban <telegram_id> - Забанить + удалить все посты\n/unban <telegram_id> - Разбанить пользователя\n/setlimit <telegram_id> <limit> - Установить лимит постов\n/getlimit <telegram_id> - Посмотреть лимит пользователя")
+            
+    except (ValueError, IndexError) as e:
+        await message.answer("Неверный формат команды")
+    except Exception as e:
+        print(f"Ошибка обработки команды: {e}")
+        await message.answer("Произошла ошибка при выполнении команды")
 
 # Обработка кнопок модерации
 @dp.callback_query()
 async def handle_moderation_buttons(callback: types.CallbackQuery):
     """Обработка кнопок модерации"""
-    if callback.message.chat.id != MODERATION_CHAT_ID:
-        return
+    try:
+        if callback.message.chat.id != MODERATION_CHAT_ID:
+            await callback.answer("Доступ запрещен")
+            return
+            
+        action, value = callback.data.split("_", 1)
         
-    action, value = callback.data.split("_", 1)
-    
-    if action == "delete":
-        await delete_post(int(value), callback.message)
-    elif action == "ban":
-        await ban_user(int(value), callback.message)
-    elif action == "hardban":
-        await hardban_user(int(value), callback.message)
-        
-    await callback.answer()
+        if action == "delete":
+            await delete_post(int(value), callback.message)
+        elif action == "ban":
+            await ban_user(int(value), callback.message)
+        elif action == "hardban":
+            await hardban_user(int(value), callback.message)
+            
+        await callback.answer()
+    except Exception as e:
+        print(f"Ошибка обработки callback: {e}")
+        await callback.answer("Произошла ошибка")
 
 # Функции модерации
 async def delete_post(post_id: int, message):
     """Удаление поста"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    
-    # Получаем пост
-    post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
-    if not post:
-        await message.answer("Пост не найден")
-        await conn.close()
-        return
-    
-    # Удаляем пост
-    await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
-    
-    # Удаляем из списков пользователей
-    await conn.execute(
-        "UPDATE users SET posts = array_remove(posts, $1), "
-        "favorites = array_remove(favorites, $1), "
-        "likes = array_remove(likes, $1), "
-        "reports = array_remove(reports, $1), "
-        "hidden = array_remove(hidden, $1)",
-        post_id
-    )
-    
-    await conn.close()
-    
-    # Уведомляем автора
     try:
-        await bot.send_message(post["telegram_id"], "❌ Ваше объявление удалено из-за нарушения")
-    except:
-        pass
-    
-    # Обновляем фронт
-    await broadcast_message({
-        "type": "post_deleted",
-        "data": {"post_id": post_id}
-    })
-    
-    await message.answer(f"✅ Пост {post_id} удален")
-
-async def ban_user(telegram_id: int, message):
-    """Бан пользователя"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    
-    await conn.execute(
-        "UPDATE users SET status = 'banned' WHERE telegram_id = $1",
-        telegram_id
-    )
-    
-    await conn.close()
-    
-    # Уведомляем пользователя
-    try:
-        await bot.send_message(telegram_id, "🚫 Ваш аккаунт заблокирован")
-    except:
-        pass
-    
-    await message.answer(f"✅ Пользователь {telegram_id} забанен")
-
-async def hardban_user(telegram_id: int, message):
-    """Хард бан пользователя"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    
-    # Получаем посты пользователя
-    user_posts = await conn.fetch(
-        "SELECT id FROM posts WHERE telegram_id = $1",
-        telegram_id
-    )
-    
-    # Удаляем все посты
-    await conn.execute("DELETE FROM posts WHERE telegram_id = $1", telegram_id)
-    
-    # Банием пользователя
-    await conn.execute(
-        "UPDATE users SET status = 'banned', posts = '{}' WHERE telegram_id = $1",
-        telegram_id
-    )
-    
-    # Удаляем посты из списков других пользователей
-    for post in user_posts:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Получаем пост
+        post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
+        if not post:
+            await message.answer("Пост не найден")
+            await conn.close()
+            return
+        
+        # Удаляем пост
+        await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
+        
+        # Удаляем из списков пользователей
         await conn.execute(
-            "UPDATE users SET "
+            "UPDATE users SET posts = array_remove(posts, $1), "
             "favorites = array_remove(favorites, $1), "
             "likes = array_remove(likes, $1), "
             "reports = array_remove(reports, $1), "
             "hidden = array_remove(hidden, $1)",
-            post["id"]
+            post_id
         )
-    
-    await conn.close()
-    
-    # Уведомляем пользователя
-    try:
-        await bot.send_message(telegram_id, "💀 Ваш аккаунт заблокирован и все объявления удалены")
-    except:
-        pass
-    
-    # Обновляем фронт
-    for post in user_posts:
+        
+        await conn.close()
+        
+        # Уведомляем автора
+        try:
+            await bot.send_message(post["telegram_id"], "❌ Ваше объявление удалено из-за нарушения")
+        except:
+            pass
+        
+        # Обновляем фронт
         await broadcast_message({
             "type": "post_deleted",
-            "data": {"post_id": post["id"]}
+            "data": {"post_id": post_id}
         })
-    
-    await message.answer(f"✅ Пользователь {telegram_id} получил хард бан")
+        
+        await message.answer(f"✅ Пост {post_id} удален")
+        
+    except Exception as e:
+        print(f"Ошибка удаления поста: {e}")
+        await message.answer(f"❌ Ошибка при удалении поста: {str(e)}")
+
+async def ban_user(telegram_id: int, message):
+    """Бан пользователя"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        result = await conn.execute(
+            "UPDATE users SET status = 'banned' WHERE telegram_id = $1",
+            telegram_id
+        )
+        
+        await conn.close()
+        
+        if result == "UPDATE 0":
+            await message.answer(f"❌ Пользователь {telegram_id} не найден")
+            return
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(telegram_id, "🚫 Ваш аккаунт заблокирован")
+        except:
+            pass
+        
+        await message.answer(f"✅ Пользователь {telegram_id} забанен")
+        
+    except Exception as e:
+        print(f"Ошибка бана пользователя: {e}")
+        await message.answer(f"❌ Ошибка при бане пользователя: {str(e)}")
+
+async def hardban_user(telegram_id: int, message):
+    """Хард бан пользователя"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Получаем посты пользователя
+        user_posts = await conn.fetch(
+            "SELECT id FROM posts WHERE telegram_id = $1",
+            telegram_id
+        )
+        
+        # Удаляем все посты
+        await conn.execute("DELETE FROM posts WHERE telegram_id = $1", telegram_id)
+        
+        # Банием пользователя
+        await conn.execute(
+            "UPDATE users SET status = 'banned', posts = '{}' WHERE telegram_id = $1",
+            telegram_id
+        )
+        
+        # Удаляем посты из списков других пользователей
+        for post in user_posts:
+            await conn.execute(
+                "UPDATE users SET "
+                "favorites = array_remove(favorites, $1), "
+                "likes = array_remove(likes, $1), "
+                "reports = array_remove(reports, $1), "
+                "hidden = array_remove(hidden, $1)",
+                post["id"]
+            )
+        
+        await conn.close()
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(telegram_id, "💀 Ваш аккаунт заблокирован и все объявления удалены")
+        except:
+            pass
+        
+        # Обновляем фронт
+        for post in user_posts:
+            await broadcast_message({
+                "type": "post_deleted",
+                "data": {"post_id": post["id"]}
+            })
+        
+        await message.answer(f"✅ Пользователь {telegram_id} получил хард бан")
+        
+    except Exception as e:
+        print(f"Ошибка хард бана: {e}")
+        await message.answer(f"❌ Ошибка при хард бане: {str(e)}")
 
 async def unban_user(telegram_id: int, message):
     """Разбан пользователя"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    
-    await conn.execute(
-        "UPDATE users SET status = 'live' WHERE telegram_id = $1",
-        telegram_id
-    )
-    
-    await conn.close()
-    
-    # Уведомляем пользователя
     try:
-        await bot.send_message(telegram_id, "✅ Вы разблокированы")
-    except:
-        pass
-    
-    await message.answer(f"✅ Пользователь {telegram_id} разбанен")
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        result = await conn.execute(
+            "UPDATE users SET status = 'live' WHERE telegram_id = $1",
+            telegram_id
+        )
+        
+        await conn.close()
+        
+        if result == "UPDATE 0":
+            await message.answer(f"❌ Пользователь {telegram_id} не найден")
+            return
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(telegram_id, "✅ Вы разблокированы")
+        except:
+            pass
+        
+        await message.answer(f"✅ Пользователь {telegram_id} разбанен")
+        
+    except Exception as e:
+        print(f"Ошибка разбана: {e}")
+        await message.answer(f"❌ Ошибка при разбане: {str(e)}")
 
 async def set_user_limit(telegram_id: int, limit: int, message):
     """Установка лимита постов"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    
-    await conn.execute(
-        "UPDATE users SET post_limit = $1 WHERE telegram_id = $2",
-        limit, telegram_id
-    )
-    
-    await conn.close()
-    
-    # Уведомляем пользователя
     try:
-        await bot.send_message(telegram_id, f"📊 Новый лимит объявлений: {limit}")
-    except:
-        pass
-    
-    await message.answer(f"✅ Лимит для {telegram_id} установлен: {limit}")
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        result = await conn.execute(
+            "UPDATE users SET post_limit = $1 WHERE telegram_id = $2",
+            limit, telegram_id
+        )
+        
+        await conn.close()
+        
+        if result == "UPDATE 0":
+            await message.answer(f"❌ Пользователь {telegram_id} не найден")
+            return
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(telegram_id, f"📊 Новый лимит объявлений: {limit}")
+        except:
+            pass
+        
+        await message.answer(f"✅ Лимит для {telegram_id} установлен: {limit}")
+        
+    except Exception as e:
+        print(f"Ошибка установки лимита: {e}")
+        await message.answer(f"❌ Ошибка при установке лимита: {str(e)}")
 
 async def get_user_limit(telegram_id: int, message):
     """Получение лимита пользователя"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    
-    user = await conn.fetchrow(
-        "SELECT post_limit, posts FROM users WHERE telegram_id = $1",
-        telegram_id
-    )
-    
-    await conn.close()
-    
-    if user:
-        current_posts = len(user["posts"])
-        await message.answer(f"📊 Пользователь {telegram_id}:\nЛимит: {user['post_limit']}\nИспользовано: {current_posts}")
-    else:
-        await message.answer("Пользователь не найден")
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        user = await conn.fetchrow(
+            "SELECT post_limit, posts FROM users WHERE telegram_id = $1",
+            telegram_id
+        )
+        
+        await conn.close()
+        
+        if user:
+            current_posts = len(user["posts"])
+            await message.answer(f"📊 Пользователь {telegram_id}:\nЛимит: {user['post_limit']}\nИспользовано: {current_posts}")
+        else:
+            await message.answer("Пользователь не найден")
+            
+    except Exception as e:
+        print(f"Ошибка получения лимита: {e}")
+        await message.answer(f"❌ Ошибка при получении лимита: {str(e)}")
 
 # API для получения всех постов
 @app.get("/api/posts")
@@ -644,7 +740,18 @@ async def get_all_posts():
     conn = await asyncpg.connect(DATABASE_URL)
     posts = await conn.fetch("SELECT * FROM posts ORDER BY created_at DESC")
     await conn.close()
-    return [dict(post) for post in posts]
+    
+    # Конвертируем datetime в строки
+    posts_list = []
+    for post in posts:
+        post_dict = dict(post)
+        if 'created_at' in post_dict and post_dict['created_at']:
+            post_dict['created_at'] = post_dict['created_at'].isoformat()
+        if 'updated_at' in post_dict and post_dict['updated_at']:
+            post_dict['updated_at'] = post_dict['updated_at'].isoformat()
+        posts_list.append(post_dict)
+    
+    return posts_list
 
 # Webhook для Telegram
 @app.post("/webhook")
