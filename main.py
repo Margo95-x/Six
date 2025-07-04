@@ -72,7 +72,13 @@ class PostUpdate(BaseModel):
 class UserAction(BaseModel):
     telegram_id: int
     post_id: int
-    action: str  # like, favorite, hide, report
+    action: str  # like, favorite, hide, report, delete
+
+class NotificationSettings(BaseModel):
+    telegram_id: int
+    likes: bool
+    system: bool
+    filters: dict
 
 # База данных
 async def init_db():
@@ -92,10 +98,21 @@ async def init_db():
             post_limit INTEGER DEFAULT 10,
             status TEXT DEFAULT 'live',
             subscriptions JSONB DEFAULT '{}',
+            notifications_likes BOOLEAN DEFAULT true,
+            notifications_system BOOLEAN DEFAULT true,
+            notifications_filters JSONB DEFAULT '{}',
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
     ''')
+    
+    # Добавляем новые колонки для существующих пользователей
+    try:
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_likes BOOLEAN DEFAULT true')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_system BOOLEAN DEFAULT true') 
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_filters JSONB DEFAULT \'{}\'')
+    except:
+        pass
     
     # Таблица постов
     await conn.execute('''
@@ -171,16 +188,68 @@ async def websocket_endpoint(websocket: WebSocket):
             elif data["type"] == "user_action":
                 action_data = UserAction(**data["data"])
                 result = await handle_user_action(action_data)
-                await broadcast_message({
-                    "type": "post_action",
-                    "data": result
+                
+                # Если это удаление собственного поста
+                if action_data.action == "delete":
+                    await broadcast_message({
+                        "type": "post_deleted",
+                        "data": {"post_id": action_data.post_id}
+                    })
+                    # Обновляем информацию о пользователе
+                    user_info = await get_user_info(action_data.telegram_id)
+                    await websocket.send_json({
+                        "type": "user_updated",
+                        "data": user_info
+                    })
+                else:
+                    await broadcast_message({
+                        "type": "post_action",
+                        "data": result
+                    })
+                    
+            elif data["type"] == "update_notifications":
+                notif_data = NotificationSettings(**data["data"])
+                await update_notification_settings(notif_data)
+                await websocket.send_json({
+                    "type": "notifications_updated",
+                    "data": {"status": "success"}
                 })
                 
     except WebSocketDisconnect:
         active_connections.discard(websocket)
 
 # Функции работы с БД
-async def sync_user(user_data: UserSync) -> dict:
+async def get_user_info(telegram_id: int) -> dict:
+    """Получение актуальной информации о пользователе"""
+    conn = await asyncpg.connect(DATABASE_URL)
+    user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+    await conn.close()
+    
+    if user:
+        user_info = dict(user)
+        # Конвертируем datetime в строки
+        if 'created_at' in user_info and user_info['created_at']:
+            user_info['created_at'] = user_info['created_at'].isoformat()
+        if 'updated_at' in user_info and user_info['updated_at']:
+            user_info['updated_at'] = user_info['updated_at'].isoformat()
+        return user_info
+    return {}
+
+async def update_notification_settings(notif_data: NotificationSettings):
+    """Обновление настроек уведомлений"""
+    conn = await asyncpg.connect(DATABASE_URL)
+    
+    await conn.execute(
+        """UPDATE users SET 
+           notifications_likes = $1, 
+           notifications_system = $2, 
+           notifications_filters = $3
+           WHERE telegram_id = $4""",
+        notif_data.likes, notif_data.system, 
+        json.dumps(notif_data.filters), notif_data.telegram_id
+    )
+    
+    await conn.close()
     """Синхронизация пользователя с БД"""
     conn = await asyncpg.connect(DATABASE_URL)
     
@@ -276,6 +345,9 @@ async def create_post(post_data: PostCreate) -> dict:
     # Отправляем в модерацию
     await send_to_moderation(post_dict, "new")
     
+    # Отправляем уведомления подписчикам
+    await send_notifications_to_subscribers(post_dict)
+    
     return post_dict
 
 async def update_post(post_data: PostUpdate) -> dict:
@@ -336,11 +408,39 @@ async def handle_user_action(action_data: UserAction) -> dict:
         action_data.telegram_id
     )
     
-    if user["status"] == "banned" and action_data.action in ["like", "report"]:
+    if user["status"] == "banned" and action_data.action in ["like", "report", "delete"]:
         await conn.close()
         raise HTTPException(status_code=403, detail="User banned")
     
-    # Обновляем пользователя
+    # Обработка удаления собственного поста
+    if action_data.action == "delete":
+        # Проверяем, что пост принадлежит пользователю
+        post = await conn.fetchrow(
+            "SELECT * FROM posts WHERE id = $1 AND telegram_id = $2",
+            action_data.post_id, action_data.telegram_id
+        )
+        
+        if not post:
+            await conn.close()
+            raise HTTPException(status_code=404, detail="Post not found or access denied")
+        
+        # Удаляем пост
+        await conn.execute("DELETE FROM posts WHERE id = $1", action_data.post_id)
+        
+        # Удаляем из списков пользователей
+        await conn.execute(
+            "UPDATE users SET posts = array_remove(posts, $1), "
+            "favorites = array_remove(favorites, $1), "
+            "likes = array_remove(likes, $1), "
+            "reports = array_remove(reports, $1), "
+            "hidden = array_remove(hidden, $1)",
+            action_data.post_id
+        )
+        
+        await conn.close()
+        return {"post_id": action_data.post_id, "action": "deleted"}
+    
+    # Обновляем пользователя для других действий
     if action_data.action == "like":
         if action_data.post_id in user["likes"]:
             new_likes = [x for x in user["likes"] if x != action_data.post_id]
@@ -363,8 +463,14 @@ async def handle_user_action(action_data: UserAction) -> dict:
         # Уведомление автору поста
         if likes_change > 0:
             post = await conn.fetchrow("SELECT telegram_id FROM posts WHERE id = $1", action_data.post_id)
-            if post:
-                await send_like_notification(post["telegram_id"], action_data.post_id, user["username"])
+            if post and post["telegram_id"] != action_data.telegram_id:
+                # Проверяем настройки уведомлений автора
+                author = await conn.fetchrow(
+                    "SELECT notifications_likes FROM users WHERE telegram_id = $1",
+                    post["telegram_id"]
+                )
+                if author and author["notifications_likes"]:
+                    await send_like_notification(post["telegram_id"], action_data.post_id, user["username"])
         
     elif action_data.action == "favorite":
         if action_data.post_id in user["favorites"]:
@@ -456,6 +562,48 @@ async def send_report_to_moderation(post: dict):
     
     await bot.send_message(MODERATION_CHAT_ID, text, reply_markup=keyboard)
 
+async def send_notifications_to_subscribers(post: dict):
+    """Отправка уведомлений о новом посте подписчикам"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Получаем всех пользователей с настройками уведомлений
+        subscribers = await conn.fetch(
+            "SELECT telegram_id, notifications_filters FROM users WHERE notifications_filters IS NOT NULL"
+        )
+        
+        await conn.close()
+        
+        for subscriber in subscribers:
+            try:
+                # Парсим фильтры подписки
+                if subscriber["notifications_filters"]:
+                    filters = json.loads(subscriber["notifications_filters"]) if isinstance(subscriber["notifications_filters"], str) else subscriber["notifications_filters"]
+                    
+                    # Проверяем соответствие фильтрам
+                    match = True
+                    if filters.get("category") and filters["category"] != "Все" and filters["category"] != post["category"]:
+                        match = False
+                    if filters.get("city") and filters["city"] != "Все" and filters["city"] != post["city"]:
+                        match = False
+                    if filters.get("gender") and filters["gender"] != "Все" and filters["gender"] != post["gender"]:
+                        match = False
+                    if filters.get("age") and filters["age"] != "Все" and filters["age"] != post["age"]:
+                        match = False
+                    if filters.get("date") and filters["date"] != "Все" and filters["date"] != post["date_tag"]:
+                        match = False
+                    
+                    # Отправляем уведомление если есть совпадение и это не автор поста
+                    if match and subscriber["telegram_id"] != post["telegram_id"]:
+                        text = f"🆕 Новое объявление!\n\n{post['description'][:100]}{'...' if len(post['description']) > 100 else ''}\n\nОт: {post['full_name']}"
+                        await bot.send_message(subscriber["telegram_id"], text)
+            except Exception as e:
+                print(f"Ошибка отправки уведомления пользователю {subscriber['telegram_id']}: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"Ошибка при отправке уведомлений подписчикам: {e}")
+
 async def send_like_notification(telegram_id: int, post_id: int, liker_username: str):
     """Уведомление о лайке"""
     text = f"👍 Вам поставили лайк на объявление #{post_id}\nОт: @{liker_username}"
@@ -542,10 +690,16 @@ async def delete_post(post_id: int, message):
             await conn.close()
             return
         
+        # Получаем автора поста для проверки настроек уведомлений
+        author = await conn.fetchrow(
+            "SELECT notifications_system FROM users WHERE telegram_id = $1",
+            post["telegram_id"]
+        )
+        
         # Удаляем пост
         await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
         
-        # Удаляем из списков пользователей
+        # Удаляем из списков пользователей и обновляем счетчик постов автора
         await conn.execute(
             "UPDATE users SET posts = array_remove(posts, $1), "
             "favorites = array_remove(favorites, $1), "
@@ -555,19 +709,36 @@ async def delete_post(post_id: int, message):
             post_id
         )
         
+        # Получаем обновленную информацию об авторе
+        updated_author = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", post["telegram_id"])
+        
         await conn.close()
         
-        # Уведомляем автора
-        try:
-            await bot.send_message(post["telegram_id"], "❌ Ваше объявление удалено из-за нарушения")
-        except:
-            pass
+        # Уведомляем автора (проверяем настройки)
+        if author and author.get("notifications_system", True):
+            try:
+                await bot.send_message(post["telegram_id"], "❌ Ваше объявление удалено из-за нарушения")
+            except:
+                pass
         
-        # Обновляем фронт
+        # Обновляем фронт - удаляем пост
         await broadcast_message({
             "type": "post_deleted",
             "data": {"post_id": post_id}
         })
+        
+        # Обновляем информацию об авторе на фронте
+        if updated_author:
+            user_info = dict(updated_author)
+            if 'created_at' in user_info and user_info['created_at']:
+                user_info['created_at'] = user_info['created_at'].isoformat()
+            if 'updated_at' in user_info and user_info['updated_at']:
+                user_info['updated_at'] = user_info['updated_at'].isoformat()
+            
+            await broadcast_message({
+                "type": "user_status_updated",
+                "data": {"telegram_id": post["telegram_id"], "user_info": user_info}
+            })
         
         await message.answer(f"✅ Пост {post_id} удален")
         
@@ -585,17 +756,33 @@ async def ban_user(telegram_id: int, message):
             telegram_id
         )
         
+        # Получаем обновленную информацию о пользователе
+        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
         await conn.close()
         
         if result == "UPDATE 0":
             await message.answer(f"❌ Пользователь {telegram_id} не найден")
             return
         
-        # Уведомляем пользователя
-        try:
-            await bot.send_message(telegram_id, "🚫 Ваш аккаунт заблокирован")
-        except:
-            pass
+        # Отправляем обновление статуса на фронт
+        if user:
+            user_info = dict(user)
+            if 'created_at' in user_info and user_info['created_at']:
+                user_info['created_at'] = user_info['created_at'].isoformat()
+            if 'updated_at' in user_info and user_info['updated_at']:
+                user_info['updated_at'] = user_info['updated_at'].isoformat()
+            
+            await broadcast_message({
+                "type": "user_status_updated",
+                "data": {"telegram_id": telegram_id, "user_info": user_info}
+            })
+        
+        # Уведомляем пользователя (проверяем настройки)
+        if user and user.get("notifications_system", True):
+            try:
+                await bot.send_message(telegram_id, "🚫 Ваш аккаунт заблокирован")
+            except:
+                pass
         
         await message.answer(f"✅ Пользователь {telegram_id} забанен")
         
@@ -665,17 +852,33 @@ async def unban_user(telegram_id: int, message):
             telegram_id
         )
         
+        # Получаем обновленную информацию о пользователе
+        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
         await conn.close()
         
         if result == "UPDATE 0":
             await message.answer(f"❌ Пользователь {telegram_id} не найден")
             return
         
+        # Отправляем обновление статуса на фронт
+        if user:
+            user_info = dict(user)
+            if 'created_at' in user_info and user_info['created_at']:
+                user_info['created_at'] = user_info['created_at'].isoformat()
+            if 'updated_at' in user_info and user_info['updated_at']:
+                user_info['updated_at'] = user_info['updated_at'].isoformat()
+            
+            await broadcast_message({
+                "type": "user_status_updated",
+                "data": {"telegram_id": telegram_id, "user_info": user_info}
+            })
+        
         # Уведомляем пользователя
-        try:
-            await bot.send_message(telegram_id, "✅ Вы разблокированы")
-        except:
-            pass
+        if user and user.get("notifications_system", True):
+            try:
+                await bot.send_message(telegram_id, "✅ Вы разблокированы")
+            except:
+                pass
         
         await message.answer(f"✅ Пользователь {telegram_id} разбанен")
         
@@ -693,17 +896,33 @@ async def set_user_limit(telegram_id: int, limit: int, message):
             limit, telegram_id
         )
         
+        # Получаем обновленную информацию о пользователе
+        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
         await conn.close()
         
         if result == "UPDATE 0":
             await message.answer(f"❌ Пользователь {telegram_id} не найден")
             return
         
+        # Отправляем обновление лимита на фронт
+        if user:
+            user_info = dict(user)
+            if 'created_at' in user_info and user_info['created_at']:
+                user_info['created_at'] = user_info['created_at'].isoformat()
+            if 'updated_at' in user_info and user_info['updated_at']:
+                user_info['updated_at'] = user_info['updated_at'].isoformat()
+            
+            await broadcast_message({
+                "type": "user_status_updated", 
+                "data": {"telegram_id": telegram_id, "user_info": user_info}
+            })
+        
         # Уведомляем пользователя
-        try:
-            await bot.send_message(telegram_id, f"📊 Новый лимит объявлений: {limit}")
-        except:
-            pass
+        if user and user.get("notifications_system", True):
+            try:
+                await bot.send_message(telegram_id, f"📊 Новый лимит объявлений: {limit}")
+            except:
+                pass
         
         await message.answer(f"✅ Лимит для {telegram_id} установлен: {limit}")
         
