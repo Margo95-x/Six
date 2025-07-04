@@ -111,6 +111,7 @@ async def init_db():
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_likes BOOLEAN DEFAULT true')
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_system BOOLEAN DEFAULT true') 
         await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_filters JSONB DEFAULT \'{}\'')
+        await conn.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT')
     except:
         pass
     
@@ -167,6 +168,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "user_synced",
                     "data": user_info
+                })
+                
+                all_posts = await get_all_posts()
+                await websocket.send_json({
+                    "type": "posts_loaded", 
+                    "data": all_posts
                 })
                 
             elif data["type"] == "create_post":
@@ -252,21 +259,20 @@ async def update_notification_settings(notif_data: NotificationSettings):
     await conn.close()
 
 async def sync_user(user_data: UserSync) -> dict:
-    """Синхронизация пользователя с БД"""
     conn = await asyncpg.connect(DATABASE_URL)
     
-    # Проверяем существование пользователя
+    avatar_url = f"https://t.me/i/userpic/160/{user_data.username}.jpg"
+    
     user = await conn.fetchrow(
         "SELECT * FROM users WHERE telegram_id = $1", 
         user_data.telegram_id
     )
     
     if user:
-        # Обновляем данные если изменились
         await conn.execute(
-            """UPDATE users SET username = $1, full_name = $2, updated_at = NOW() 
-               WHERE telegram_id = $3""",
-            user_data.username, user_data.full_name, user_data.telegram_id
+            """UPDATE users SET username = $1, full_name = $2, avatar_url = $3, updated_at = NOW() 
+               WHERE telegram_id = $4""",
+            user_data.username, user_data.full_name, avatar_url, user_data.telegram_id
         )
         user_info = dict(user)
         # Конвертируем datetime в строки
@@ -277,14 +283,15 @@ async def sync_user(user_data: UserSync) -> dict:
     else:
         # Создаем нового пользователя
         await conn.execute(
-            """INSERT INTO users (telegram_id, username, full_name) 
-               VALUES ($1, $2, $3)""",
-            user_data.telegram_id, user_data.username, user_data.full_name
+            """INSERT INTO users (telegram_id, username, full_name, avatar_url) 
+               VALUES ($1, $2, $3, $4)""",
+            user_data.telegram_id, user_data.username, user_data.full_name, avatar_url
         )
         user_info = {
             "telegram_id": user_data.telegram_id,
             "username": user_data.username,
             "full_name": user_data.full_name,
+            "avatar_url": avatar_url,
             "posts": [],
             "hidden": [],
             "favorites": [],
@@ -367,11 +374,11 @@ async def create_post(post_data: PostCreate) -> dict:
     # Создаем пост
     post_id = await conn.fetchval(
         """INSERT INTO posts (telegram_id, description, category, city, gender, age, date_tag, username, full_name, avatar_url)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id""",
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id""",
         post_data.telegram_id, post_data.description, post_data.category,
         post_data.city, post_data.gender, post_data.age, post_data.date,
         user["username"], user["full_name"], 
-        f"https://api.telegram.org/file/bot/photos/user_{post_data.telegram_id}.jpg"
+        user["avatar_url"] 
     )
     
     # Обновляем список постов пользователя
